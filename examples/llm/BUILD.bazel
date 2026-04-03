@@ -29,6 +29,14 @@ zig_binary(
     deps = ["//zml"],
 )
 
+zig_binary(
+    name = "ministral_3_tests",
+    srcs = glob(["**/*.zig"]),
+    main = "models/ministral_3_tests.zig",
+    visibility = ["//visibility:public"],
+    deps = ["//zml"],
+)
+
 build_test(
     name = "test",
     targets = [":llm"],
