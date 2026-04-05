@@ -5,7 +5,7 @@ const stdx = zml.stdx;
 
 const common = @import("../common.zig");
 
-const log = std.log.scoped(.lfm);
+const log = std.log.scoped(.ministral3);
 
 const RopeParameters = struct {
     beta_fast: f32,
@@ -64,11 +64,30 @@ lm_head: LmHead,
 
 const LmHead = struct {
     norm: RMSNorm,
+
+    pub fn unloadBuffers(self: *zml.Bufferized(LmHead)) void {
+        RMSNorm.unloadBuffers(&self.norm);
+    }
+
+    pub fn forward(self: *LmHead, hidden: zml.Tensor) zml.Tensor {
+        const logits = self.norm.forward(hidden, .{.d});
+        // TODO: implement sampling strategy
+        return logits;
+    }
 };
 
 const RMSNorm = struct {
     weights: zml.Tensor,
     eps: f32,
+
+    pub fn unloadBuffers(self: *zml.Bufferized(RMSNorm)) void {
+        self.weights.deinit();
+    }
+
+    pub fn forward(self: RMSNorm, hidden: zml.Tensor, tag: anytype) zml.Tensor {
+        const normalized = zml.nn.rmsNorm(hidden, tag, self.eps);
+        return normalized.mul(self.weights.broad(hidden.shape())).reuseBuffer(hidden);
+    }
 };
 
 const Layer = struct {
@@ -76,6 +95,30 @@ const Layer = struct {
         down_proj: zml.Tensor,
         gate_proj: zml.Tensor,
         up_proj: zml.Tensor,
+
+        pub fn unloadBuffers(self: *zml.Bufferized(Mlp)) void {
+            self.down_proj.deinit();
+            self.gate_proj.deinit();
+            self.up_proj.deinit();
+        }
+
+        pub fn forward(self: *Mlp, x: zml.Tensor) zml.Tensor {
+            // def mlp(x):
+            // gate = x @ W_gate.T
+            // up   = x @ W_up.T
+            //
+            // # SwiGLU activation
+            // activated = silu(gate) * up
+            //
+            // out = activated @ W_down.T
+            //
+            // return out
+
+            const up = self.up_proj.forward(x);
+            var activated = self.gate_proj.forward(x);
+            activated = activated.silu().mul(up);
+            return self.down_proj.forward(activated);
+        }
     };
 
     const Attention = struct {
@@ -83,6 +126,83 @@ const Layer = struct {
         q_proj: zml.Tensor,
         v_proj: zml.Tensor,
         o_proj: zml.Tensor,
+
+        pub fn unloadBuffers(self: *zml.Bufferized(Attention)) void {
+            self.k_proj.deinit();
+            self.q_proj.deinit();
+            self.v_proj.deinit();
+            self.o_proj.deinit();
+        }
+
+        pub fn forward(
+            self: *Attention,
+            x: zml.Tensor,
+            token_index: zml.Tensor,
+            kv_cache: KvCache,
+            attention_metadata: zml.attention.attention.Metadata,
+            attention_parameters: zml.attention.attention.Parameters,
+        ) zml.Tensor {
+            _ = kv_cache; // autofix
+            // def self_attention(x):
+            //     # Projections
+            //     Q = x @ Wq.T
+            //     K = x @ Wk.T
+            //     V = x @ Wv.T
+            //
+            //     # reshape to heads
+            //     Q = reshape_heads(Q)
+            //     K = reshape_heads(K)
+            //     V = reshape_heads(V)
+            //
+            //     # (optional) apply RoPE here
+            //     Q, K = apply_rope(Q, K)
+            //
+            //     # ---- KV cache logic ----
+            //     K_cache = concat(prev_K, K)
+            //     V_cache = concat(prev_V, V)
+            //
+            //     # Attention scores
+            //     scores = Q @ K_cache.transpose(-1, -2)
+            //     scores = scores / sqrt(head_dim)
+            //
+            //     scores = causal_mask(scores)
+            //
+            //     probs = softmax(scores)
+            //
+            //     # Weighted sum
+            //     context = probs @ V_cache
+            //
+            //     # merge heads
+            //     context = merge_heads(context)
+            //
+            //     # Output projection
+            //     out = context @ Wo.T
+            //
+            //     return out
+            var Q = self.q_proj.forward(x);
+            var K = self.k_proj.forward(x);
+            const V = self.v_proj.forward(x);
+
+            // TODO: reshape and apply rope
+            const pos_index = token_index;
+            Q = zml.nn.rope(Q, pos_index, self.rope_opts);
+            K = zml.nn.rope(K, pos_index, self.rope_opts);
+            const attn_output = zml.attention.attention.attention(
+                Q,
+                K,
+                V,
+                token_index,
+                attention_metadata,
+                attention_parameters,
+            );
+
+            const attn = attn_output.merge(.{ .d = .{ .h, .hd } }).rename(.{ .q = .s });
+            const delta = self.o_proj.forward(attn)
+                .rename(.{ .dout = .d })
+                .withPartitioning(.{ .d = .replicated });
+            // return .{ delta, new_kv_cache };
+            return delta;
+        }
     };
 
     input_norm: RMSNorm,
@@ -100,24 +220,58 @@ const Layer = struct {
                 .eps = config.text_config.rms_norm_eps,
             },
             .self_attn = .{
-                .k_proj = attn_store.withPrefix("k_proj").createTensor("weight", .{.k_proj}, null),
-                .q_proj = attn_store.withPrefix("q_proj").createTensor("weight", .{.q_proj}, null),
-                .v_proj = attn_store.withPrefix("v_proj").createTensor("weight", .{.v_proj}, null),
-                .o_proj = attn_store.withPrefix("o_proj").createTensor("weight", .{.o_proj}, null),
+                .k_proj = attn_store.withPrefix("k_proj").createTensor("weight", .{ .e, .f }, null),
+                .q_proj = attn_store.withPrefix("q_proj").createTensor("weight", .{ .g, .h }, null),
+                .v_proj = attn_store.withPrefix("v_proj").createTensor("weight", .{ .i, .j }, null),
+                .o_proj = attn_store.withPrefix("o_proj").createTensor("weight", .{ .k, .l }, null),
             },
             .post_attn = .{
                 .weights = store.withPrefix("post_attention_layernorm").createTensor("weight", .{.post_attn}, null),
                 .eps = config.text_config.rms_norm_eps,
             },
             .feed_fwd = .{
-                .down_proj = mlp_store.withPrefix("down_proj").createTensor("weight", .{.down_proj}, null),
-                .gate_proj = mlp_store.withPrefix("gate_proj").createTensor("weight", .{.gate_proj}, null),
-                .up_proj = mlp_store.withPrefix("up_proj").createTensor("weight", .{.up_proj}, null),
+                .down_proj = mlp_store.withPrefix("down_proj").createTensor("weight", .{ .m, .n }, null),
+                .gate_proj = mlp_store.withPrefix("gate_proj").createTensor("weight", .{ .o, .p }, null),
+                .up_proj = mlp_store.withPrefix("up_proj").createTensor("weight", .{ .q, .r }, null),
             },
         };
     }
 
     pub fn deinit(_: *const Layer, _: std.mem.Allocator) void {}
+
+    pub fn unloadBuffers(self: *zml.Bufferized(Layer)) void {
+        RMSNorm.unloadBuffers(&self.input_norm);
+        Attention.unloadBuffers(&self.self_attn);
+        RMSNorm.unloadBuffers(&self.post_attn);
+        Mlp.unloadBuffers(&self.feed_fwd);
+    }
+
+    pub fn forward(
+        self: *Layer,
+        x: zml.Tensor,
+        tokens_index: zml.Tensor,
+        cur_seq_len: zml.Tensor,
+        cache: KvCache,
+        cache_index: zml.Tensor,
+        conv_cache_index: zml.Tensor,
+        kv_cache_index: zml.Tensor,
+        attention_metadata: zml.attention.attention.Metadata,
+        attention_parameters: zml.attention.attention.Parameters,
+        conv_parameters: ConvParameters,
+    ) struct { zml.Tensor, KvCache, zml.Tensor, zml.Tensor } {
+        _ = cur_seq_len; // autofix
+        _ = cache_index; // autofix
+        _ = conv_parameters; // autofix
+        const attn_norm = self.input_norm.forward(x, .{.a});
+        const attn = self.self_attn.forward(attn_norm, tokens_index, cache, attention_metadata, attention_parameters);
+        x = x + attn; // residual
+
+        const feed_norm = self.post_attn.forward(x, .{.b});
+        const feed_fwd = self.feed_fwd.forward(feed_norm);
+        x = x + feed_fwd; // residual
+
+        return .{ x, cache, conv_cache_index, kv_cache_index };
+    }
 };
 
 pub fn init(
@@ -152,9 +306,7 @@ pub fn init(
 }
 
 pub fn deinit(self: Self, allocator: std.mem.Allocator) void {
-    for (self.layers) |layer| {
-        layer.deinit(allocator);
-    }
+    allocator.free(self.layers);
 }
 
 pub fn loadBuffers(
@@ -189,4 +341,49 @@ pub fn loadBuffers(
     });
 }
 
-pub fn unloadBuffers(_: *zml.Bufferized(Self), _: std.mem.Allocator) void {}
+pub fn unloadBuffers(self: *zml.Bufferized(Self), allocator: std.mem.Allocator) void {
+    self.embed_tokens.deinit();
+    for (self.layers) |*layer| {
+        Layer.unloadBuffers(layer);
+    }
+    LmHead.unloadBuffers(&self.lm_head);
+    allocator.free(self.layers);
+}
+
+const KvCache = struct {};
+
+const ConvParameters = struct {};
+
+pub fn forward(
+    self: Self,
+    tokens: zml.Tensor,
+    tokens_index: zml.Tensor,
+    cur_seq_len: zml.Tensor,
+    kv_cache: KvCache,
+    attention_metadata: zml.attention.attention.Metadata,
+    attention_parameters: zml.attention.attention.Parameters,
+    conv_parameters: ConvParameters,
+) zml.Tensor {
+    var cache = kv_cache;
+    var conv_cache_index = zml.Tensor.scalar(@as(u32, 0), .u32);
+    var kv_cache_index = zml.Tensor.scalar(@as(u32, 0), .u32);
+
+    var hidden = self.embed_tokens.forward(tokens);
+
+    for (self.layers) |layer| {
+        hidden, cache, conv_cache_index, kv_cache_index = layer.forward(
+            hidden,
+            tokens_index,
+            cur_seq_len,
+            cache,
+            conv_cache_index,
+            kv_cache_index,
+            attention_metadata,
+            attention_parameters,
+            conv_parameters,
+        );
+    }
+
+    const next_tokens = self.lm_head.forward(hidden);
+    return next_tokens;
+}

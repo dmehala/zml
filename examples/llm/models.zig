@@ -8,6 +8,7 @@ pub const GenerationOptions = common.GenerationOptions;
 pub const parseConfig = common.parseConfig;
 pub const lfm2 = @import("models/lfm2.zig");
 pub const llama = @import("models/llama.zig");
+pub const mistral3 = @import("models/ministral_3.zig");
 pub const qwen3_5 = @import("models/qwen3_5.zig");
 
 const log = std.log.scoped(.llm);
@@ -16,6 +17,7 @@ pub const ModelType = enum {
     lfm2,
     llama,
     qwen3_5,
+    mistral3,
 };
 
 const RawConfig = struct {
@@ -26,6 +28,7 @@ pub const LoadedModel = union(ModelType) {
     lfm2: lfm2.LoadedModel,
     llama: llama.LoadedModel,
     qwen3_5: qwen3_5.LoadedModel,
+    mistral3: mistral3.LoadedModel,
 
     pub fn load(
         allocator: std.mem.Allocator,
@@ -41,6 +44,7 @@ pub const LoadedModel = union(ModelType) {
             .lfm2 => .{ .lfm2 = try lfm2.LoadedModel.init(allocator, io, repo, store, generation) },
             .llama => .{ .llama = try llama.LoadedModel.init(allocator, io, repo, store, generation) },
             .qwen3_5 => .{ .qwen3_5 = try qwen3_5.LoadedModel.init(allocator, io, repo, store, generation) },
+            .mistral3 => .{ .mistral3 = try mistral3.LoadedModel.init(allocator, io, repo, store, generation) },
         };
     }
 
@@ -55,6 +59,7 @@ pub const LoadedModel = union(ModelType) {
             .lfm2 => |*m| .{ .lfm2 = try m.loadBuffers(allocator, io, platform, store, progress, shardings) },
             .llama => |*m| .{ .llama = try m.loadBuffers(allocator, io, platform, store, progress, shardings) },
             .qwen3_5 => |*m| .{ .qwen3_5 = try m.loadBuffers(allocator, io, platform, store, progress, shardings) },
+            .mistral3 => |*m| .{ .mistral3 = try m.loadBuffers(allocator, io, platform, store, progress, shardings) },
         };
     }
 
@@ -70,6 +75,10 @@ pub const LoadedModel = union(ModelType) {
             },
             .qwen3_5 => |*loaded_model| switch (buffers.*) {
                 .qwen3_5 => |*loaded_buffers| loaded_model.unloadBuffers(loaded_buffers, allocator),
+                else => unreachable,
+            },
+            .mistral3 => |*loaded_model| switch (buffers.*) {
+                .mistral3 => |*loaded_buffers| loaded_model.unloadBuffers(loaded_buffers, allocator),
                 else => unreachable,
             },
         }
@@ -113,6 +122,15 @@ pub const LoadedModel = union(ModelType) {
                 seqlen,
                 progress,
             ) },
+            .mistral3 => |*m| .{ .mistral3 = try m.compile(
+                allocator,
+                io,
+                platform,
+                backend,
+                shardings,
+                seqlen,
+                progress,
+            ) },
         };
         return .{
             .inner = inner,
@@ -126,6 +144,7 @@ pub const CompiledModel = struct {
         lfm2: lfm2.inference.CompiledModel,
         llama: llama.inference.CompiledModel,
         qwen3_5: qwen3_5.inference.CompiledModel,
+        mistral3: mistral3.inference.CompiledModel,
     };
 
     inner: Inner,
@@ -136,6 +155,7 @@ pub const CompiledModel = struct {
             .lfm2 => |*b| b.deinit(),
             .llama => |*b| b.deinit(),
             .qwen3_5 => |*b| b.deinit(),
+            .mistral3 => |*b| b.deinit(),
         }
     }
 
@@ -181,6 +201,7 @@ pub const CompiledModel = struct {
                 ) },
                 .seqlen = self.seqlen,
             },
+            .mistral3 => error.mistral3NotImplemented,
         };
     }
 };
@@ -189,6 +210,7 @@ pub const Buffers = union(ModelType) {
     lfm2: lfm2.Buffers,
     llama: llama.Buffers,
     qwen3_5: qwen3_5.Buffers,
+    mistral3: mistral3.Buffers,
 };
 
 pub const Session = struct {
@@ -196,6 +218,7 @@ pub const Session = struct {
         lfm2: lfm2.Session,
         llama: llama.Session,
         qwen3_5: qwen3_5.Session,
+        mistral3: mistral3.Session,
     };
 
     inner: Inner,

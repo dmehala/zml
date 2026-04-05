@@ -4,7 +4,7 @@ const zml = @import("zml");
 
 const common = @import("../common.zig");
 const inference = @import("inference.zig");
-const Ministral3 = @import("ministral3.zig");
+pub const Ministral3 = @import("ministral3.zig");
 
 pub const Buffers = zml.Bufferized(Ministral3);
 
@@ -45,8 +45,8 @@ pub const LoadedModel = struct {
         return self.inner.loadBuffers(allocator, io, platform, store, progress, shardings);
     }
 
-    pub fn unloadBuffers(self: *const LoadedModel, buffers: *Buffers, allocator: std.mem.Allocator) void {
-        self.inner.unloadBuffers(buffers, allocator);
+    pub fn unloadBuffers(_: *const LoadedModel, buffers: *Buffers, allocator: std.mem.Allocator) void {
+        Ministral3.unloadBuffers(buffers, allocator);
     }
 
     pub fn compile(
@@ -59,14 +59,11 @@ pub const LoadedModel = struct {
         seqlen: usize,
         progress: *std.Progress.Node,
     ) !inference.CompiledModel {
-        _ = self; // autofix
-        _ = allocator; // autofix
-        _ = io; // autofix
-        _ = platform; // autofix
         _ = backend; // autofix
         _ = shardings; // autofix
         _ = seqlen; // autofix
-        _ = progress; // autofix
-        return error.ModelNotImplemented;
+        // const params = inference.CompilationParameters.init(self.inner, self.parsed_config.value, @intCast(seqlen), backend, false, shardings);
+        // return inference.CompiledModel.init(allocator, io, @constCast(platform), self, self.inner, params, progress);
+        return inference.CompiledModel.init(allocator, io, @constCast(platform), self.inner, progress);
     }
 };
