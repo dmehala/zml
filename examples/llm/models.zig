@@ -201,7 +201,17 @@ pub const CompiledModel = struct {
                 ) },
                 .seqlen = self.seqlen,
             },
-            .mistral3 => error.mistral3NotImplemented,
+            .mistral3 => |*compiled| .{
+                .inner = .{ .mistral3 = try mistral3.Session.init(
+                    allocator,
+                    io,
+                    platform,
+                    tokenizer,
+                    compiled,
+                    &model_buffers.mistral3,
+                ) },
+                .seqlen = self.seqlen,
+            },
         };
     }
 };

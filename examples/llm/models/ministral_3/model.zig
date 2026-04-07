@@ -59,11 +59,7 @@ pub const LoadedModel = struct {
         seqlen: usize,
         progress: *std.Progress.Node,
     ) !inference.CompiledModel {
-        _ = backend; // autofix
-        _ = shardings; // autofix
-        _ = seqlen; // autofix
-        // const params = inference.CompilationParameters.init(self.inner, self.parsed_config.value, @intCast(seqlen), backend, false, shardings);
-        // return inference.CompiledModel.init(allocator, io, @constCast(platform), self, self.inner, params, progress);
-        return inference.CompiledModel.init(allocator, io, @constCast(platform), self.inner, progress);
+        const opts = inference.CompilationOptions.init(self.parsed_config.value, self.inner, shardings, backend, seqlen);
+        return inference.CompiledModel.init(allocator, io, @constCast(platform), self.inner, opts, progress);
     }
 };
