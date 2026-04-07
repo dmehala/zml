@@ -137,7 +137,7 @@ fn run(
         layer_buffers.input_norm,
         sharding,
         .{ .absolute_tolerance = 1e-2 },
-        .{ .a, .c, .d },
+        .{ .a, .c, .hidden },
     );
 
     // try testAttentionLayer(
@@ -164,7 +164,7 @@ fn run(
         layer_buffers.post_attn,
         sharding,
         .{ .absolute_tolerance = 2e-2 },
-        .{ .a, .c, .d },
+        .{ .a, .c, .hidden },
     );
 
     try testLayerWithTags(
@@ -177,7 +177,7 @@ fn run(
         layer_buffers.feed_fwd,
         sharding,
         .{ .absolute_tolerance = 2e-2 },
-        .{ .a, .c, .d },
+        .{ .a, .c, .hidden },
     );
 }
 

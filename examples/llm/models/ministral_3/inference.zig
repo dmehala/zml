@@ -22,6 +22,7 @@ pub const CompilationOptions = struct {
             .shardings = shardings,
             .cache = .init(.init(.{
                 .layer = config.text_config.num_hidden_layers,
+                .batch = 1,
                 .k = seqlen,
                 .h = config.text_config.num_key_value_heads,
                 .hd = config.text_config.head_dim,

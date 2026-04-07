@@ -77,15 +77,15 @@ const RMSNorm = struct {
 
 const Layer = struct {
     const Mlp = struct {
-        up_proj: zml.nn.Linear,
         down_proj: zml.nn.Linear,
         gate_proj: zml.nn.Linear,
+        up_proj: zml.nn.Linear,
 
         pub fn init(store: zml.io.TensorStore.View) Mlp {
             return .{
-                .up_proj = .init(store.withPrefix("up_proj").createTensor("weight", .{ .dout, .d }, null), null, .d),
-                .down_proj = .init(store.withPrefix("down_proj").createTensor("weight", .{ .d, .dout }, null), null, .dout),
-                .gate_proj = .init(store.withPrefix("gate_proj").createTensor("weight", .{ .dout, .d }, null), null, .d),
+                .down_proj = .init(store.withPrefix("down_proj").createTensor("weight", .{ .hidden, .dout }, null), null, .dout),
+                .gate_proj = .init(store.withPrefix("gate_proj").createTensor("weight", .{ .dout, .hidden }, null), null, .hidden),
+                .up_proj = .init(store.withPrefix("up_proj").createTensor("weight", .{ .dout, .hidden }, null), null, .hidden),
             };
         }
 
@@ -121,15 +121,17 @@ const Layer = struct {
         o_proj: zml.nn.Linear,
         rope_opts: zml.nn.RopeOpts,
         head_dim: u32,
+        num_kv_heads: u32,
 
         pub fn init(config: Config, store: zml.io.TensorStore.View) Attention {
             return .{
-                .k_proj = .init(store.withPrefix("k_proj").createTensor("weight", .{ .e, .f }, null), null, .f),
-                .q_proj = .init(store.withPrefix("q_proj").createTensor("weight", .{ .dout, .d }, null), null, .dout),
-                .v_proj = .init(store.withPrefix("v_proj").createTensor("weight", .{ .e, .f }, null), null, .f),
-                .o_proj = .init(store.withPrefix("o_proj").createTensor("weight", .{ .e, .f }, null), null, .f),
+                .k_proj = .init(store.withPrefix("k_proj").createTensor("weight", .{ .e, .hidden }, null), null, .hidden),
+                .q_proj = .init(store.withPrefix("q_proj").createTensor("weight", .{ .dout, .hidden }, null), null, .hidden),
+                .v_proj = .init(store.withPrefix("v_proj").createTensor("weight", .{ .e, .hidden }, null), null, .hidden),
+                .o_proj = .init(store.withPrefix("o_proj").createTensor("weight", .{ .hidden, .d }, null), null, .d),
                 .rope_opts = config.text_config.rope_parameters,
                 .head_dim = config.text_config.head_dim,
+                .num_kv_heads = config.text_config.num_key_value_heads,
             };
         }
 
@@ -151,14 +153,19 @@ const Layer = struct {
         ) struct { zml.Tensor, KvCache } {
             // splitAxis for multi head attention.
             var q = self.q_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
-            var k = self.k_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
-            var v = self.v_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
+            var k = self.k_proj.forward(x).splitAxis(-1, .{ .h = self.num_kv_heads, .hd = self.head_dim });
+            var v = self.v_proj.forward(x).splitAxis(-1, .{ .h = self.num_kv_heads, .hd = self.head_dim });
 
             // Do I need this?
             const token_positions = token_index;
 
             q = zml.nn.rope(q, token_positions, self.rope_opts);
             k = zml.nn.rope(k, token_positions, self.rope_opts);
+
+            // Rename to match kvcache tags
+            q = q.rename(.{ .seq = .q });
+            k = k.rename(.{ .seq = .k });
+            v = v.rename(.{ .seq = .k });
 
             const new_kv_cache = kv_cache.update(k, v, token_index, cache_index);
             k = new_kv_cache.keys(cache_index);
@@ -173,7 +180,7 @@ const Layer = struct {
                 attention_parameters,
             );
 
-            const attn_heads = attn_scores.merge(.{ .d = .{ .h, .hd } }).rename(.{ .q = .s });
+            const attn_heads = attn_scores.merge(.{ .d = .{ .h, .hd } });
             return .{ self.o_proj.forward(attn_heads).reuseBuffer(x), new_kv_cache.reuseBuffer(kv_cache) };
         }
     };
@@ -189,15 +196,15 @@ const Layer = struct {
 
         return .{
             .input_norm = .{
-                .weights = store.withPrefix("input_layernorm").createTensor("weight", .{.d}, null),
+                .weights = store.withPrefix("input_layernorm").createTensor("weight", .{.hidden}, null),
                 .eps = config.text_config.rms_norm_eps,
-                .tag = zml.Shape.toTag(.d),
+                .tag = zml.Shape.toTag(.hidden),
             },
             .self_attn = .init(config, attn_store),
             .post_attn = .{
-                .weights = store.withPrefix("post_attention_layernorm").createTensor("weight", .{.d}, null),
+                .weights = store.withPrefix("post_attention_layernorm").createTensor("weight", .{.hidden}, null),
                 .eps = config.text_config.rms_norm_eps,
-                .tag = zml.Shape.toTag(.d),
+                .tag = zml.Shape.toTag(.hidden),
             },
             .feed_fwd = .init(mlp_store),
         };
@@ -350,29 +357,27 @@ pub fn forward(
     attention_metadata: zml.attention.attention.Metadata,
     attention_parameters: zml.attention.attention.Parameters,
 ) zml.Tensor {
-    _ = tokens_index; // autofix
-    _ = kv_cache; // autofix
-    _ = attention_metadata; // autofix
-    _ = attention_parameters; // autofix
     stdx.debug.assert(tokens.shape().hasTags(.{ .batch, .seq }), "Tokens should have tags {{.batch, .seq}}, got {f}", .{tokens.shape()});
 
-    // var cache = kv_cache;
-    // var kv_cache_index = zml.Tensor.scalar(@as(u32, 0), .u32);
+    var cache = kv_cache;
+    var kv_cache_index = zml.Tensor.scalar(@as(u32, 0), .u32);
 
     log.info("tokens.shape: {f}", .{tokens.shape()});
-    const hidden = self.embed_tokens.forward(tokens).renameTag(.d, .hidden);
+    var hidden = self.embed_tokens.forward(tokens).renameTag(.d, .hidden);
     log.info("hidden.shape: {f}", .{hidden.shape()});
 
-    // for (self.layers) |*layer| {
-    //     hidden, cache, kv_cache_index = layer.forward(
-    //         hidden,
-    //         tokens_index,
-    //         cache,
-    //         kv_cache_index,
-    //         attention_metadata,
-    //         attention_parameters,
-    //     );
-    // }
+    for (self.layers) |*layer| {
+        hidden, cache, kv_cache_index = layer.forward(
+            hidden,
+            tokens_index,
+            cache,
+            kv_cache_index,
+            attention_metadata,
+            attention_parameters,
+        );
+    }
+
+    // Maybe add RMSNorm here before forwarding to `lm_head`.
 
     const logits = self.lm_head.forward(hidden);
     log.info("logits.shape: {f}", .{logits.shape()});
