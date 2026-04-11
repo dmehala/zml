@@ -10,8 +10,9 @@ const log = std.log.scoped(.ministral3);
 pub const CompilationOptions = struct {
     batch_dim: u32,
     seqlen: usize,
+    rng: zml.Tensor.Rng,
     shardings: common.Shardings,
-    cache: Ministral3.KvCache,
+    kv_cache: Ministral3.KvCache,
     attention_metadata: zml.attention.attention.Metadata,
     attention_parameters: zml.attention.attention.Parameters,
 
@@ -19,8 +20,9 @@ pub const CompilationOptions = struct {
         return .{
             .batch_dim = 1,
             .seqlen = seqlen,
+            .rng = .init(),
             .shardings = shardings,
-            .cache = .init(.init(.{
+            .kv_cache = .init(.init(.{
                 .layer = config.text_config.num_hidden_layers,
                 .batch = 1,
                 .k = seqlen,
@@ -36,6 +38,7 @@ pub const CompilationOptions = struct {
 pub const CompiledModel = struct {
     prefill: KernelExe,
     decode: KernelExe,
+    params: CompilationOptions,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -47,7 +50,8 @@ pub const CompiledModel = struct {
     ) !CompiledModel {
         return .{
             .prefill = try compileKernel(allocator, io, platform, model, opts.shardings, opts, progress),
-            .decode = try compileKernel(allocator, io, platform, model, opts.shardings, opts, progress),
+            .decode = try compileDecoderKernel(allocator, io, platform, model, opts.shardings, opts, progress),
+            .params = opts,
         };
     }
 
@@ -76,7 +80,37 @@ fn compileKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platfo
         .{
             tokens,
             token_position_offset,
-            opts.cache,
+            opts.rng,
+            opts.kv_cache,
+            opts.attention_metadata,
+            opts.attention_parameters,
+        },
+        .{ .shardings = &all_shardings },
+    );
+    return .{ .exe = exe };
+}
+
+fn compileDecoderKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platform, model: Ministral3, shardings: common.Shardings, opts: CompilationOptions, progress: *std.Progress.Node) !KernelExe {
+    progress.increaseEstimatedTotalItems(1);
+    var node = progress.start("Compiling single kernel...", 1);
+    defer node.end();
+    const now: std.Io.Timestamp = .now(io, .awake);
+    defer log.info("Compiled single kernel [{f}]", .{now.untilNow(io, .awake)});
+
+    const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = 1 }, .u32);
+    const token_position_offset: zml.Tensor = .init(.{ .batch = opts.batch_dim }, .u32);
+
+    const all_shardings = shardings.all();
+    const exe = try platform.compile(
+        allocator,
+        io,
+        model,
+        .forward,
+        .{
+            tokens,
+            token_position_offset,
+            opts.rng,
+            opts.kv_cache,
             opts.attention_metadata,
             opts.attention_parameters,
         },
@@ -87,6 +121,12 @@ fn compileKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platfo
 
 const Args = struct {
     allocator: std.mem.Allocator,
+    model_buffers: *zml.Bufferized(Ministral3),
+    tokens_buf: *zml.Buffer,
+    tokens_pos_buffer: *zml.Buffer,
+    rng_buffer: *zml.Bufferized(zml.Tensor.Rng),
+    kv_cache_buffers: *zml.Bufferized(Ministral3.KvCache),
+    attention_metadata_buffers: zml.Bufferized(zml.attention.attention.Metadata),
 };
 
 const KernelExe = struct {
@@ -100,32 +140,42 @@ const KernelExe = struct {
         var exe_args = try self.exe.args(args.allocator);
         defer exe_args.deinit(args.allocator);
 
+        exe_args.set(.{
+            args.model_buffers,
+            args.tokens_buf,
+            args.tokens_pos_buffer,
+            args.rng_buffer,
+            args.kv_cache_buffers,
+            args.attention_metadata_buffers,
+        });
+
         var results = try self.exe.results(args.allocator);
         defer results.deinit(args.allocator);
 
-        exe_args.set(.{});
         self.exe.call(exe_args, &results);
 
-        var tokens, var cache = results.get(struct {
+        var tokens, var kv_cache, var rng = results.get(struct {
             zml.Buffer,
             zml.Bufferized(Ministral3.KvCache),
+            zml.Bufferized(zml.Tensor.Rng),
         });
 
-        replaceBuffer(args.tokens_buf, &tokens);
-        replaceCacheBuffers(args.cache_buffers, &cache);
+        swapBuffer(args.tokens_buf, &tokens);
+        swapBuffer(&args.rng_buffer._state, &rng._state);
+        swapCacheBuffers(args.kv_cache_buffers, &kv_cache);
     }
 };
 
-fn replaceBuffer(dst: *zml.Buffer, src: *zml.Buffer) void {
+fn swapBuffer(dst: *zml.Buffer, src: *zml.Buffer) void {
     if (!sameBufferHandle(dst.*, src.*)) {
         dst.deinit();
     }
     dst.* = src.*;
 }
 
-fn replaceCacheBuffers(dst: *zml.Bufferized(Ministral3.KvCache), src: *zml.Bufferized(Ministral3.KvCache)) void {
-    replaceBuffer(&dst.kv.k, &src.kv.k);
-    replaceBuffer(&dst.kv.v, &src.kv.v);
+fn swapCacheBuffers(dst: *zml.Bufferized(Ministral3.KvCache), src: *zml.Bufferized(Ministral3.KvCache)) void {
+    swapBuffer(&dst.k, &src.k);
+    swapBuffer(&dst.v, &src.v);
 }
 
 fn sameBufferHandle(a: zml.Buffer, b: zml.Buffer) bool {

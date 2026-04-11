@@ -46,7 +46,11 @@ embed_tokens: zml.nn.TokenEmbedding,
 layers: []Layer,
 
 // Final layer
+norm_head: RMSNorm,
+
 lm_head: LmHead,
+
+sampling: zml.nn.SamplingStrategy,
 
 const LmHead = struct {
     weight: zml.Tensor,
@@ -232,9 +236,9 @@ const Layer = struct {
         const attn, const cache_ = self.self_attn.forward(attn_norm, tokens_index, cache, cache_index, attention_metadata, attention_parameters);
         var x_ = x.add(attn); // residual
 
-        const feed_norm = self.post_attn.forward(x);
+        const feed_norm = self.post_attn.forward(x_);
         const feed_fwd = self.feed_fwd.forward(feed_norm);
-        x_ = x.add(feed_fwd); // residual
+        x_ = x_.add(feed_fwd); // residual
 
         return .{ x_, cache_, cache_index };
     }
@@ -244,12 +248,13 @@ pub fn init(
     allocator: std.mem.Allocator,
     store: zml.io.TensorStore.View,
     config: Config,
-    _: common.GenerationOptions,
+    opts: common.GenerationOptions,
 ) !Self {
     const model_store = store.withPrefix("language_model.model");
 
     // TODO: Use `maybeCreateTensor`.
     const embed_tokens = model_store.withPrefix("embed_tokens").createTensor("weight", .{ .voc, .hidden }, null);
+    const norm = model_store.withPrefix("norm").createTensor("weight", .{.hidden}, null);
 
     stdx.debug.assert(config.text_config.num_hidden_layers != 0, "expected at least one layer", .{});
     const layers = try allocator.alloc(Layer, config.text_config.num_hidden_layers);
@@ -261,7 +266,13 @@ pub fn init(
     return .{
         .embed_tokens = .{ .weight = embed_tokens },
         .layers = layers,
+        .norm_head = .{
+            .weights = norm,
+            .eps = config.text_config.rms_norm_eps,
+            .tag = zml.Shape.toTag(.hidden),
+        },
         .lm_head = .{ .weight = embed_tokens },
+        .sampling = opts.sampling_strategy,
     };
 }
 
@@ -353,18 +364,19 @@ pub fn forward(
     self: Self,
     tokens: zml.Tensor,
     tokens_index: zml.Tensor,
+    rng: zml.Tensor.Rng,
     kv_cache: KvCache,
     attention_metadata: zml.attention.attention.Metadata,
     attention_parameters: zml.attention.attention.Parameters,
-) zml.Tensor {
+) struct { zml.Tensor, KvCache, zml.Tensor.Rng } {
     stdx.debug.assert(tokens.shape().hasTags(.{ .batch, .seq }), "Tokens should have tags {{.batch, .seq}}, got {f}", .{tokens.shape()});
 
     var cache = kv_cache;
     var kv_cache_index = zml.Tensor.scalar(@as(u32, 0), .u32);
 
-    log.info("tokens.shape: {f}", .{tokens.shape()});
+    // log.info("tokens.shape: {f}", .{tokens.shape()});
     var hidden = self.embed_tokens.forward(tokens).renameTag(.d, .hidden);
-    log.info("hidden.shape: {f}", .{hidden.shape()});
+    // log.info("hidden.shape: {f}", .{hidden.shape()});
 
     for (self.layers) |*layer| {
         hidden, cache, kv_cache_index = layer.forward(
@@ -377,9 +389,9 @@ pub fn forward(
         );
     }
 
-    // Maybe add RMSNorm here before forwarding to `lm_head`.
-
+    hidden = self.norm_head.forward(hidden);
     const logits = self.lm_head.forward(hidden);
-    log.info("logits.shape: {f}", .{logits.shape()});
-    return logits;
+
+    const gen_tokens, const new_rng = zml.nn.sampleTokens(logits, self.sampling, rng);
+    return .{ gen_tokens.convert(tokens.dtype()).reuseBuffer(tokens), cache, new_rng };
 }
