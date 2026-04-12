@@ -105,6 +105,7 @@ pub fn main(init: std.process.Init) !void {
     const generation: models.GenerationOptions = .{
         .sampling_strategy = .{
             .topk = args.topk,
+            .temperature = 0.15,
         },
     };
 

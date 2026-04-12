@@ -90,225 +90,215 @@ fn run(
     sharding: zml.sharding.Sharding,
     backend: zml.attention.attention.Backend,
 ) !void {
-    _ = backend; // autofix
     var registry: zml.safetensors.TensorRegistry = try .fromPath(allocator, io, activations_path);
     defer registry.deinit();
 
     var activation_store: zml.io.TensorStore = .fromRegistry(allocator, &registry);
     defer activation_store.deinit();
 
-    try testLayer(
-        allocator,
-        io,
-        platform,
-        activation_store.view(),
+    var ctx = TestContext{
+        .allocator = allocator,
+        .io = io,
+        .platform = platform,
+        .activation_store = activation_store.view(),
+        .sharding = sharding,
+        .backend = backend,
+    };
+
+    try ctx.testLayer(
         "model.model.language_model.embed_tokens",
         mdl.embed_tokens,
         model_buffers.embed_tokens,
-        sharding,
         .{ .absolute_tolerance = 1e-3 },
     );
 
-    try testLayerWithTags(
-        allocator,
-        io,
-        platform,
-        activation_store.view(),
+    try ctx.testLayerWithTags(
         "model.lm_head",
         mdl.lm_head,
         model_buffers.lm_head,
-        sharding,
         .{ .absolute_tolerance = 2e-2 },
         .{ .batch, .seq, .hidden },
     );
 
-    if (mdl.layers.len == 0) return;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
 
-    const layer = mdl.layers[0];
-    const layer_buffers = model_buffers.layers[0];
+    // expect layers.len == context.layer
+    for (mdl.layers, 0..) |layer, i| {
+        const layer_buffers = model_buffers.layers[i];
 
-    try testLayerWithTags(
-        allocator,
-        io,
-        platform,
-        activation_store.view(),
-        "model.model.language_model.layers.0.input_layernorm",
-        layer.input_norm,
-        layer_buffers.input_norm,
-        sharding,
-        .{ .absolute_tolerance = 1e-2 },
-        .{ .a, .c, .hidden },
-    );
+        try ctx.testLayerWithTags(
+            try std.fmt.allocPrint(arena.allocator(), "model.model.language_model.layers.{d}.input_layernorm", .{i}),
+            layer.input_norm,
+            layer_buffers.input_norm,
+            .{ .absolute_tolerance = 1e-2 },
+            .{ .batch, .seq, .hidden },
+        );
 
-    // try testAttentionLayer(
-    //     allocator,
-    //     io,
-    //     platform,
-    //     activation_store.view(),
-    //     "model.model.language_model.layers.0.self_attn",
-    //     layer.self_attn,
-    //     layer_buffers.self_attn,
-    //     sharding,
-    //     .{ .absolute_tolerance = 1e-2 },
-    //     .{ .a, .c, .d },
-    //     backend,
-    // );
+        // try ctx.testAttentionLayer(
+        //     "model.model.language_model.layers.0.self_attn",
+        //     layer.self_attn,
+        //     layer_buffers.self_attn,
+        //     .{ .absolute_tolerance = 1e-2 },
+        //     .{ .batch, .seq, .hidden },
+        //     backend,
+        // );
 
-    try testLayerWithTags(
-        allocator,
-        io,
-        platform,
-        activation_store.view(),
-        "model.model.language_model.layers.0.post_attention_layernorm",
-        layer.post_attn,
-        layer_buffers.post_attn,
-        sharding,
-        .{ .absolute_tolerance = 2e-2 },
-        .{ .a, .c, .hidden },
-    );
+        try ctx.testLayerWithTags(
+            try std.fmt.allocPrint(arena.allocator(), "model.model.language_model.layers.{d}.post_attention_layernorm", .{i}),
+            layer.post_attn,
+            layer_buffers.post_attn,
+            .{ .absolute_tolerance = 2e-2 },
+            .{ .batch, .seq, .hidden },
+        );
 
-    try testLayerWithTags(
-        allocator,
-        io,
-        platform,
-        activation_store.view(),
-        "model.model.language_model.layers.0.mlp",
-        layer.feed_fwd,
-        layer_buffers.feed_fwd,
-        sharding,
-        .{ .absolute_tolerance = 2e-2 },
-        .{ .a, .c, .hidden },
-    );
+        try ctx.testLayerWithTags(
+            try std.fmt.allocPrint(arena.allocator(), "model.model.language_model.layers.{d}.mlp", .{i}),
+            layer.feed_fwd,
+            layer_buffers.feed_fwd,
+            .{ .absolute_tolerance = 2e-2 },
+            .{ .batch, .seq, .hidden },
+        );
+    }
 }
 
-fn testLayer(
+const TestContext = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    platform: *const zml.Platform,
+    platform: *zml.Platform,
     activation_store: zml.io.TensorStore.View,
-    name: []const u8,
-    layer: anytype,
-    layer_weights: zml.Bufferized(@TypeOf(layer)),
     sharding: zml.sharding.Sharding,
-    opts: zml.testing.CompareOpts,
-) !void {
-    const in_key = try std.fmt.allocPrint(allocator, "{s}.in.0", .{name});
-    defer allocator.free(in_key);
-    const in_shape = activation_store.getShape(in_key) orelse return error.NotFound;
-    var in_buffer = try loadBufferFromStore(allocator, io, platform, activation_store, in_key, sharding);
-    defer in_buffer.deinit();
-    const in_tensor = zml.Tensor.fromShape(in_shape);
-
-    const out_key = try std.fmt.allocPrint(allocator, "{s}.out.0", .{name});
-    defer allocator.free(out_key);
-    var out_buffer_expected = try loadBufferFromStore(allocator, io, platform, activation_store, out_key, sharding);
-    defer out_buffer_expected.deinit();
-
-    const exe = try platform.compileFn(allocator, io, @TypeOf(layer).forward, .{ layer, in_tensor }, .{ .shardings = &.{sharding} });
-    defer exe.deinit();
-
-    var args = try exe.args(allocator);
-    defer args.deinit(allocator);
-    args.set(.{ layer_weights, in_buffer });
-
-    var res = try exe.results(allocator);
-    defer res.deinit(allocator);
-
-    exe.call(args, &res);
-
-    var out_result = res.get(zml.Buffer);
-    defer out_result.deinit();
-    try zml.testing.expectClose(io, out_result, out_buffer_expected, opts);
-}
-
-fn testLayerWithTags(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    platform: *const zml.Platform,
-    activation_store: zml.io.TensorStore.View,
-    name: []const u8,
-    layer: anytype,
-    layer_weights: zml.Bufferized(@TypeOf(layer)),
-    sharding: zml.sharding.Sharding,
-    opts: zml.testing.CompareOpts,
-    tags: anytype,
-) !void {
-    const in_key = try std.fmt.allocPrint(allocator, "{s}.in.0", .{name});
-    defer allocator.free(in_key);
-    const in_shape = activation_store.getShape(in_key) orelse return error.NotFound;
-    var in_buffer = try loadBufferFromStore(allocator, io, platform, activation_store, in_key, sharding);
-    defer in_buffer.deinit();
-    const in_tensor = zml.Tensor.fromShape(in_shape).withTags(tags);
-
-    const out_key = try std.fmt.allocPrint(allocator, "{s}.out.0", .{name});
-    defer allocator.free(out_key);
-    var out_buffer_expected = try loadBufferFromStore(allocator, io, platform, activation_store, out_key, sharding);
-    defer out_buffer_expected.deinit();
-
-    const exe = try platform.compileFn(allocator, io, @TypeOf(layer).forward, .{ layer, in_tensor }, .{ .shardings = &.{sharding} });
-    defer exe.deinit();
-
-    var args = try exe.args(allocator);
-    defer args.deinit(allocator);
-    args.set(.{ layer_weights, in_buffer });
-
-    var res = try exe.results(allocator);
-    defer res.deinit(allocator);
-
-    exe.call(args, &res);
-
-    var out_result = res.get(zml.Buffer);
-    defer out_result.deinit();
-    try zml.testing.expectClose(io, out_result, out_buffer_expected, opts);
-}
-
-fn testAttentionLayer(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    platform: *const zml.Platform,
-    activation_store: zml.io.TensorStore.View,
-    name: []const u8,
-    layer: anytype,
-    layer_weights: zml.Bufferized(@TypeOf(layer)),
-    sharding: zml.sharding.Sharding,
-    opts: zml.testing.CompareOpts,
-    tags: anytype,
     backend: zml.attention.attention.Backend,
-) !void {
-    const in_key = try std.fmt.allocPrint(allocator, "{s}.in.0", .{name});
-    defer allocator.free(in_key);
-    const in_shape = activation_store.getShape(in_key) orelse return error.NotFound;
-    var in_buffer = try loadBufferFromStore(allocator, io, platform, activation_store, in_key, sharding);
-    defer in_buffer.deinit();
-    const in_tensor = zml.Tensor.fromShape(in_shape).withTags(tags);
+    fn testLayer(
+        self: TestContext,
+        name: []const u8,
+        layer: anytype,
+        layer_weights: zml.Bufferized(@TypeOf(layer)),
+        opts: zml.testing.CompareOpts,
+    ) !void {
+        const in_key = try std.fmt.allocPrint(self.allocator, "{s}.in.0", .{name});
+        defer self.allocator.free(in_key);
+        const in_shape = self.activation_store.getShape(in_key) orelse return error.NotFound;
+        var in_buffer = try loadBufferFromStore(self.allocator, self.io, self.platform, self.activation_store, in_key, self.sharding);
+        defer in_buffer.deinit();
+        const in_tensor = zml.Tensor.fromShape(in_shape);
 
-    const out_key = try std.fmt.allocPrint(allocator, "{s}.out.0", .{name});
-    defer allocator.free(out_key);
-    var out_buffer_expected = try loadBufferFromStore(allocator, io, platform, activation_store, out_key, sharding);
-    defer out_buffer_expected.deinit();
+        const out_key = try std.fmt.allocPrint(self.allocator, "{s}.out.0", .{name});
+        defer self.allocator.free(out_key);
+        var out_buffer_expected = try loadBufferFromStore(self.allocator, self.io, self.platform, self.activation_store, out_key, self.sharding);
+        defer out_buffer_expected.deinit();
 
-    const cache: ministral.Model.KvCache = .init(.init(.{ 3072, 3072 }, .bf16)); //< find shape of kvcache
-    const token_index = zml.Tensor.iota(in_shape, 1);
-    const cache_index = zml.Tensor.scalar(@as(u32, 0), .u32);
+        const exe = try self.platform.compileFn(self.allocator, self.io, @TypeOf(layer).forward, .{ layer, in_tensor }, .{ .shardings = &.{self.sharding} });
+        defer exe.deinit();
 
-    const seqlen = 11;
-    const attention_heads = 32;
-    const attention_metadata: zml.attention.attention.Metadata = .init(.fromBackend(backend, seqlen, attention_heads));
-    const attention_params: zml.attention.attention.Parameters = .init(.fromBackend(backend));
+        var args = try exe.args(self.allocator);
+        defer args.deinit(self.allocator);
+        args.set(.{ layer_weights, in_buffer });
 
-    const exe = try platform.compileFn(allocator, io, @TypeOf(layer).forward, .{ layer, in_tensor, token_index, cache, cache_index, attention_metadata, attention_params }, .{ .shardings = &.{sharding} });
-    defer exe.deinit();
+        var res = try exe.results(self.allocator);
+        defer res.deinit(self.allocator);
 
-    var args = try exe.args(allocator);
-    defer args.deinit(allocator);
-    args.set(.{ layer_weights, in_buffer });
+        exe.call(args, &res);
 
-    var res = try exe.results(allocator);
-    defer res.deinit(allocator);
+        var out_result = res.get(zml.Buffer);
+        defer out_result.deinit();
+        try zml.testing.expectClose(self.io, out_result, out_buffer_expected, opts);
+    }
 
-    exe.call(args, &res);
+    fn testLayerWithTags(
+        self: TestContext,
+        name: []const u8,
+        layer: anytype,
+        layer_weights: zml.Bufferized(@TypeOf(layer)),
+        opts: zml.testing.CompareOpts,
+        tags: anytype,
+    ) !void {
+        const in_key = try std.fmt.allocPrint(self.allocator, "{s}.in.0", .{name});
+        defer self.allocator.free(in_key);
 
-    var out_result = res.get(zml.Buffer);
-    defer out_result.deinit();
-    try zml.testing.expectClose(io, out_result, out_buffer_expected, opts);
-}
+        const in_shape = self.activation_store.getShape(in_key) orelse return error.NotFound;
+        var in_buffer = try loadBufferFromStore(self.allocator, self.io, self.platform, self.activation_store, in_key, self.sharding);
+        defer in_buffer.deinit();
+        const in_tensor = zml.Tensor.fromShape(in_shape).withTags(tags);
+
+        const out_key = try std.fmt.allocPrint(self.allocator, "{s}.out.0", .{name});
+        defer self.allocator.free(out_key);
+        var out_buffer_expected = try loadBufferFromStore(self.allocator, self.io, self.platform, self.activation_store, out_key, self.sharding);
+        defer out_buffer_expected.deinit();
+
+        const exe = try self.platform.compileFn(self.allocator, self.io, @TypeOf(layer).forward, .{ layer, in_tensor }, .{ .shardings = &.{self.sharding} });
+        defer exe.deinit();
+
+        var args = try exe.args(self.allocator);
+        defer args.deinit(self.allocator);
+        args.set(.{ layer_weights, in_buffer });
+
+        var res = try exe.results(self.allocator);
+        defer res.deinit(self.allocator);
+
+        exe.call(args, &res);
+
+        var out_result = res.get(zml.Buffer);
+        defer out_result.deinit();
+        try zml.testing.expectClose(self.io, out_result, out_buffer_expected, opts);
+    }
+
+    fn testAttentionLayer(
+        self: TestContext,
+        name: []const u8,
+        layer: anytype,
+        layer_weights: zml.Bufferized(@TypeOf(layer)),
+        opts: zml.testing.CompareOpts,
+        tags: anytype,
+        backend: zml.attention.attention.Backend,
+    ) !void {
+        const in_key = try std.fmt.allocPrint(self.allocator, "{s}.in.0", .{name});
+        defer self.allocator.free(in_key);
+
+        const in_shape = self.activation_store.getShape(in_key) orelse return error.NotFound;
+        var in_buffer = try loadBufferFromStore(self.allocator, self.io, self.platform, self.activation_store, in_key, self.sharding);
+        defer in_buffer.deinit();
+        const in_tensor = zml.Tensor.fromShape(in_shape).withTags(tags);
+
+        const out_key = try std.fmt.allocPrint(self.allocator, "{s}.out.0", .{name});
+        defer self.allocator.free(out_key);
+        var out_buffer_expected = try loadBufferFromStore(self.allocator, self.io, self.platform, self.activation_store, out_key, self.sharding);
+        defer out_buffer_expected.deinit();
+
+        const seqlen = 11;
+        const head_dim = 128;
+        const attention_heads = 32;
+        const num_key_value_heads = 8;
+
+        const cache: ministral.Model.KvCache = .init(.init(.{
+            .layer = 26,
+            .batch = 1,
+            .k = seqlen,
+            .h = num_key_value_heads,
+            .hd = head_dim,
+        }, .bf16));
+
+        // const token_index = zml.Tensor.iota(in_shape, 1);
+        const token_index: zml.Tensor = .init(.{ .batch = 1 }, .u32);
+        const cache_index: zml.Tensor = .init(.{}, .u32);
+
+        const attention_metadata: zml.attention.attention.Metadata = .init(.fromBackend(backend, seqlen, attention_heads));
+        const attention_params: zml.attention.attention.Parameters = .init(.fromBackend(backend));
+
+        const exe = try self.platform.compileFn(self.allocator, self.io, @TypeOf(layer).forward, .{ layer, in_tensor, token_index, cache, cache_index, attention_metadata, attention_params }, .{ .shardings = &.{self.sharding} });
+        defer exe.deinit();
+
+        var args = try exe.args(self.allocator);
+        defer args.deinit(self.allocator);
+        args.set(.{ layer_weights, in_buffer });
+
+        var res = try exe.results(self.allocator);
+        defer res.deinit(self.allocator);
+
+        exe.call(args, &res);
+
+        var out_result = res.get(zml.Buffer);
+        defer out_result.deinit();
+        try zml.testing.expectClose(self.io, out_result, out_buffer_expected, opts);
+    }
+};

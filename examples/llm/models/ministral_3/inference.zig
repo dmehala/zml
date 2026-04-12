@@ -17,18 +17,13 @@ pub const CompilationOptions = struct {
     attention_parameters: zml.attention.attention.Parameters,
 
     pub fn init(config: Ministral3.Config, model: Ministral3, shardings: common.Shardings, backend: zml.attention.attention.Backend, seqlen: usize) CompilationOptions {
+        const batch_dim = 1;
         return .{
-            .batch_dim = 1,
+            .batch_dim = batch_dim,
             .seqlen = seqlen,
             .rng = .init(),
             .shardings = shardings,
-            .kv_cache = .init(.init(.{
-                .layer = config.text_config.num_hidden_layers,
-                .batch = 1,
-                .k = seqlen,
-                .h = config.text_config.num_key_value_heads,
-                .hd = config.text_config.head_dim,
-            }, model.embed_tokens.weight.dtype())),
+            .kv_cache = .init(config, model, batch_dim, seqlen),
             .attention_metadata = .init(.fromBackend(backend, @intCast(seqlen), @intCast(config.text_config.num_attention_heads))),
             .attention_parameters = .init(.fromBackend(backend)),
         };
@@ -63,10 +58,10 @@ pub const CompiledModel = struct {
 
 fn compileKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platform, model: Ministral3, shardings: common.Shardings, opts: CompilationOptions, progress: *std.Progress.Node) !KernelExe {
     progress.increaseEstimatedTotalItems(1);
-    var node = progress.start("Compiling single kernel...", 1);
+    var node = progress.start("Compiling prefill kernel...", 1);
     defer node.end();
     const now: std.Io.Timestamp = .now(io, .awake);
-    defer log.info("Compiled single kernel [{f}]", .{now.untilNow(io, .awake)});
+    defer log.info("Compiled prefill kernel [{f}]", .{now.untilNow(io, .awake)});
 
     const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = opts.seqlen }, .u32);
     const token_position_offset: zml.Tensor = .init(.{ .batch = opts.batch_dim }, .u32);
@@ -92,10 +87,10 @@ fn compileKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platfo
 
 fn compileDecoderKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platform, model: Ministral3, shardings: common.Shardings, opts: CompilationOptions, progress: *std.Progress.Node) !KernelExe {
     progress.increaseEstimatedTotalItems(1);
-    var node = progress.start("Compiling single kernel...", 1);
+    var node = progress.start("Compiling decoder kernel...", 1);
     defer node.end();
     const now: std.Io.Timestamp = .now(io, .awake);
-    defer log.info("Compiled single kernel [{f}]", .{now.untilNow(io, .awake)});
+    defer log.info("Compiled decoder kernel [{f}]", .{now.untilNow(io, .awake)});
 
     const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = 1 }, .u32);
     const token_position_offset: zml.Tensor = .init(.{ .batch = opts.batch_dim }, .u32);

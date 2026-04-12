@@ -1,12 +1,15 @@
 const std = @import("std");
 
 const zml = @import("zml");
+const stdx = zml.stdx;
 
 const inference = @import("inference.zig");
 const Ministral3 = @import("ministral3.zig");
 const model = @import("model.zig");
 
 const Self = @This();
+
+const log = std.log.scoped(.session);
 
 allocator: std.mem.Allocator,
 
@@ -74,8 +77,11 @@ pub fn tokenizePrompt(self: *const Self, allocator: std.mem.Allocator, prompt: [
     var encoder = try self.tokenizer.encoder();
     defer encoder.deinit();
 
+    const bos_token = self.tokenizer.tokenToId("<s>") orelse return error.NoSuchToken;
+
     // TODO: read system prompt from repo and add it
     var tokens: std.ArrayList(u32) = try .initCapacity(allocator, prompt.len);
+    try tokens.append(allocator, bos_token);
     try tokens.appendSlice(allocator, try encoder.encode(prompt));
 
     return tokens.toOwnedSlice(allocator);
@@ -85,12 +91,13 @@ pub fn tokenizeTurn(self: *const Self, allocator: std.mem.Allocator, prompt: []c
     return self.tokenizePrompt(allocator, prompt);
 }
 
-pub fn runPrefill(self: *Self, all_tokens: []const u32) !void {
+pub fn runPrefill(self: *Self, tokens: []const u32) !void {
+    stdx.debug.assert(self.seqlen > tokens.len, "input tokens of size {d} exceed seqlen size of {d}", .{ tokens.len, self.seqlen });
+
     const tokens_slice: zml.Slice = try .alloc(self.allocator, .init(.{ .batch = 1, .seq = self.seqlen }, .u32));
     defer tokens_slice.free(self.allocator);
 
-    // TODO: Make sure all_tokens < seqlen?
-    @memcpy(tokens_slice.items(u32)[0..all_tokens.len], all_tokens);
+    @memcpy(tokens_slice.items(u32)[0..tokens.len], tokens);
 
     const replicated_sharding = try zml.sharding.replicatedSharding(self.platform);
 
@@ -112,7 +119,7 @@ pub fn runPrefill(self: *Self, all_tokens: []const u32) !void {
     });
 
     try tokens_buffer.toSlice(self.io, tokens_slice);
-    self.generated_token_slice.items(u32)[0] = tokens_slice.items(u32)[all_tokens.len - 1];
+    self.generated_token_slice.items(u32)[0] = tokens_slice.items(u32)[tokens.len - 1];
 }
 
 pub fn runDecode(self: *Self, all_tokens: *std.ArrayList(u32), stdout: *std.Io.Writer) !void {
@@ -121,16 +128,23 @@ pub fn runDecode(self: *Self, all_tokens: *std.ArrayList(u32), stdout: *std.Io.W
 
     const replicated_sharding = try zml.sharding.replicatedSharding(self.platform);
 
-    var current_token_buffer: zml.Buffer = try .fromSlice(self.io, self.platform, self.generated_token_slice, replicated_sharding);
-    defer current_token_buffer.deinit();
+    var token_buffer: zml.Buffer = try .fromSlice(self.io, self.platform, self.generated_token_slice, replicated_sharding);
+    defer token_buffer.deinit();
 
-    while (true) {
+    const end_token = self.tokenizer.tokenToId("</s>");
+
+    generation: while (true) {
         const token_id = self.generated_token_slice.items(u32)[0];
+
+        if (token_id == end_token) break :generation;
 
         if (try decoder.next(token_id)) |token| {
             try stdout.writeAll(token);
             try stdout.flush();
         }
+
+        try all_tokens.append(self.allocator, token_id);
+        if (all_tokens.items.len >= self.seqlen) break :generation;
 
         const token_pos_slice: zml.Slice = .init(zml.Shape.init(.{ .batch = 1 }, .u32), std.mem.sliceAsBytes(&[_]u32{@intCast(all_tokens.items.len)}));
         var token_pos_buffer: zml.Buffer = try .fromSlice(self.io, self.platform, token_pos_slice, replicated_sharding);
@@ -139,13 +153,13 @@ pub fn runDecode(self: *Self, all_tokens: *std.ArrayList(u32), stdout: *std.Io.W
         try self.compiled_model.decode.run(.{
             .allocator = self.allocator,
             .model_buffers = self.model_buffers,
-            .tokens_buf = &current_token_buffer,
+            .tokens_buf = &token_buffer,
             .tokens_pos_buffer = &token_pos_buffer,
             .rng_buffer = &self.rng_buffers,
             .kv_cache_buffers = &self.kv_cache_buffers,
             .attention_metadata_buffers = self.attention_metadata_buffers,
         });
 
-        try current_token_buffer.toSlice(self.io, self.generated_token_slice);
+        try token_buffer.toSlice(self.io, self.generated_token_slice);
     }
 }

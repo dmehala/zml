@@ -1143,6 +1143,10 @@ pub fn load(
 
     meta.forEachVisit(model, *const Tensor, struct {
         fn call(i: usize, tensor: *const Tensor, ctx: *Ctx) void {
+            if (ctx.progress) |progress| {
+                progress.increaseEstimatedTotalItems(1);
+            }
+
             ctx.group.concurrent(ctx.io, struct {
                 fn call(i_: usize, tensor_: *const Tensor, ctx_: *Ctx) !void {
                     var reader = ctx_.store.getReaderById(tensor_.id, ctx_.io, &.{}) catch unreachable;

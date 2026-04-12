@@ -160,8 +160,10 @@ const Layer = struct {
             var k = self.k_proj.forward(x).splitAxis(-1, .{ .h = self.num_kv_heads, .hd = self.head_dim });
             var v = self.v_proj.forward(x).splitAxis(-1, .{ .h = self.num_kv_heads, .hd = self.head_dim });
 
-            // Do I need this?
-            const token_positions = token_index;
+            const token_positions = b: {
+                const sh = token_index.shape().insert(.last, .{ .seq = x.dim(.seq) });
+                break :b zml.Tensor.iota(sh, .seq).convert(.u32).add(token_index.broad(sh));
+            };
 
             q = zml.nn.rope(q, token_positions, self.rope_opts);
             k = zml.nn.rope(k, token_positions, self.rope_opts);
@@ -240,7 +242,8 @@ const Layer = struct {
         const feed_fwd = self.feed_fwd.forward(feed_norm);
         x_ = x_.add(feed_fwd); // residual
 
-        return .{ x_, cache_, cache_index };
+        const cache_index_ = cache_index.add(zml.Tensor.scalar(@as(u32, 1), .u32));
+        return .{ x_, cache_, cache_index_ };
     }
 };
 
@@ -325,12 +328,26 @@ pub const KvCache = struct {
     k: zml.Tensor,
     v: zml.Tensor,
 
-    pub fn init(kv_shape: zml.Shape) KvCache {
-        return .{ .k = .fromShape(kv_shape), .v = .fromShape(kv_shape) };
+    pub fn init(config: Config, model: Self, batch: usize, seqlen: usize) KvCache {
+        const kv_shape: zml.Shape = .init(.{
+            .layer = config.text_config.num_hidden_layers,
+            .batch = batch,
+            .k = seqlen,
+            .h = config.text_config.num_key_value_heads,
+            .hd = config.text_config.head_dim,
+        }, model.embed_tokens.weight.dtype());
+
+        return .{
+            .k = .fromShape(kv_shape),
+            .v = .fromShape(kv_shape),
+        };
     }
 
     pub fn initBuffers(self: KvCache, io: std.Io, platform: *const zml.Platform, sharding: zml.sharding.Sharding) !zml.Bufferized(KvCache) {
-        return .{ .k = try zml.Buffer.uninitialized(io, platform, self.k.shape(), sharding, .{}), .v = try zml.Buffer.uninitialized(io, platform, self.v.shape(), sharding, .{}) };
+        return .{
+            .k = try zml.Buffer.uninitialized(io, platform, self.k.shape(), sharding, .{}),
+            .v = try zml.Buffer.uninitialized(io, platform, self.v.shape(), sharding, .{}),
+        };
     }
 
     pub fn unloadBuffers(self: *zml.Bufferized(KvCache)) void {
@@ -339,7 +356,10 @@ pub const KvCache = struct {
     }
 
     pub fn reuseBuffer(self: KvCache, other: KvCache) KvCache {
-        return .{ .k = self.k.reuseBuffer(other.k), .v = self.v.reuseBuffer(other.v) };
+        return .{
+            .k = self.k.reuseBuffer(other.k),
+            .v = self.v.reuseBuffer(other.v),
+        };
     }
 
     pub fn keys(self: KvCache, cache_index: zml.Tensor) zml.Tensor {
@@ -374,9 +394,7 @@ pub fn forward(
     var cache = kv_cache;
     var kv_cache_index = zml.Tensor.scalar(@as(u32, 0), .u32);
 
-    // log.info("tokens.shape: {f}", .{tokens.shape()});
     var hidden = self.embed_tokens.forward(tokens).renameTag(.d, .hidden);
-    // log.info("hidden.shape: {f}", .{hidden.shape()});
 
     for (self.layers) |*layer| {
         hidden, cache, kv_cache_index = layer.forward(
@@ -393,5 +411,5 @@ pub fn forward(
     const logits = self.lm_head.forward(hidden);
 
     const gen_tokens, const new_rng = zml.nn.sampleTokens(logits, self.sampling, rng);
-    return .{ gen_tokens.convert(tokens.dtype()).reuseBuffer(tokens), cache, new_rng };
+    return .{ gen_tokens.convert(tokens.dtype()).reuseBuffer(tokens), cache.reuseBuffer(kv_cache), new_rng };
 }
