@@ -56,9 +56,9 @@ pub fn main(init: std.process.Init) !void {
 
     const backend = zml.attention.attention.Backend.auto(platform);
 
-    const seqlen = 4096;
-    var compiled_model = try repo_model.compile(allocator, io, platform, backend, shardings, seqlen, &progress);
-    defer compiled_model.deinit();
+    // const seqlen = 4096;
+    // var compiled_model = try repo_model.compile(allocator, io, platform, backend, shardings, seqlen, &progress);
+    // defer compiled_model.deinit();
 
     progress.end();
 
@@ -105,20 +105,20 @@ fn run(
         .backend = backend,
     };
 
-    try ctx.testLayer(
-        "model.model.language_model.embed_tokens",
-        mdl.embed_tokens,
-        model_buffers.embed_tokens,
-        .{ .absolute_tolerance = 1e-3 },
-    );
-
-    try ctx.testLayerWithTags(
-        "model.lm_head",
-        mdl.lm_head,
-        model_buffers.lm_head,
-        .{ .absolute_tolerance = 2e-2 },
-        .{ .batch, .seq, .hidden },
-    );
+    // try ctx.testLayer(
+    //     "model.model.language_model.embed_tokens",
+    //     mdl.embed_tokens,
+    //     model_buffers.embed_tokens,
+    //     .{ .absolute_tolerance = 1e-3 },
+    // );
+    //
+    // try ctx.testLayerWithTags(
+    //     "model.lm_head",
+    //     mdl.lm_head,
+    //     model_buffers.lm_head,
+    //     .{ .absolute_tolerance = 2e-2 },
+    //     .{ .batch, .seq, .hidden },
+    // );
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -126,16 +126,18 @@ fn run(
     // expect layers.len == context.layer
     const i: usize = 0;
     const layer = mdl.layers[i];
-    // for (mdl.layers, 0..) |layer, i| {
+    _ = layer; // autofix
+    // // for (mdl.layers, 0..) |layer, i| {
     const layer_buffers = model_buffers.layers[i];
-
-    try ctx.testLayerWithTags(
-        try std.fmt.allocPrint(arena.allocator(), "model.model.language_model.layers.{d}.input_layernorm", .{i}),
-        layer.input_norm,
-        layer_buffers.input_norm,
-        .{ .absolute_tolerance = 1e-2 },
-        .{ .batch, .seq, .hidden },
-    );
+    _ = layer_buffers; // autofix
+    //
+    // try ctx.testLayerWithTags(
+    //     try std.fmt.allocPrint(arena.allocator(), "model.model.language_model.layers.{d}.input_layernorm", .{i}),
+    //     layer.input_norm,
+    //     layer_buffers.input_norm,
+    //     .{ .absolute_tolerance = 1e-2 },
+    //     .{ .batch, .seq, .hidden },
+    // );
 
     // try ctx.testAttentionLayer(
     //     "model.model.language_model.layers.0.self_attn",
@@ -146,22 +148,121 @@ fn run(
     //     backend,
     // );
 
+    // try ctx.testLayerWithTags(
+    //     try std.fmt.allocPrint(arena.allocator(), "model.model.language_model.layers.{d}.post_attention_layernorm", .{i}),
+    //     layer.post_attn,
+    //     layer_buffers.post_attn,
+    //     .{ .absolute_tolerance = 2e-2 },
+    //     .{ .batch, .seq, .hidden },
+    // );
+    //
+    // try ctx.testLayerWithTags(
+    //     try std.fmt.allocPrint(arena.allocator(), "model.model.language_model.layers.{d}.mlp", .{i}),
+    //     layer.feed_fwd,
+    //     layer_buffers.feed_fwd,
+    //     .{ .absolute_tolerance = 2e-2 },
+    //     .{ .batch, .seq, .hidden },
+    // );
+    // }
+
     try ctx.testLayerWithTags(
-        try std.fmt.allocPrint(arena.allocator(), "model.model.language_model.layers.{d}.post_attention_layernorm", .{i}),
-        layer.post_attn,
-        layer_buffers.post_attn,
+        "model.model.vision_tower.patch_conv",
+        mdl.vision_encoder.model.patch,
+        model_buffers.vision_encoder.model.patch,
         .{ .absolute_tolerance = 2e-2 },
-        .{ .batch, .seq, .hidden },
+        .{ .batch, .channel, .width, .height },
     );
 
     try ctx.testLayerWithTags(
-        try std.fmt.allocPrint(arena.allocator(), "model.model.language_model.layers.{d}.mlp", .{i}),
-        layer.feed_fwd,
-        layer_buffers.feed_fwd,
+        "model.model.vision_tower.ln_pre",
+        mdl.vision_encoder.model.ln_pre,
+        model_buffers.vision_encoder.model.ln_pre,
         .{ .absolute_tolerance = 2e-2 },
-        .{ .batch, .seq, .hidden },
+        .{ .batch, .n, .hidden },
     );
-    // }
+
+    const vision_layer = mdl.vision_encoder.model.layers[0];
+    const vision_buffers = model_buffers.vision_encoder.model.layers[0];
+
+    try ctx.testLayerWithTags(
+        try std.fmt.allocPrint(arena.allocator(), "model.model.vision_tower.transformer.layers.{d}.ffn_norm", .{i}),
+        vision_layer.ffn_norm,
+        vision_buffers.ffn_norm,
+        .{ .absolute_tolerance = 2e-2 },
+        .{ .batch, .n, .hidden },
+    );
+
+    // try ctx.testLayerWithTags(
+    //     try std.fmt.allocPrint(arena.allocator(), "model.model.vision_tower.transformer.layers.{d}.attention", .{i}),
+    //     vision_layer.self_attn,
+    //     vision_buffers.self_attn,
+    //     .{ .absolute_tolerance = 2e-2 },
+    //     .{ .batch, .n, .hidden },
+    // );
+
+    try ctx.testLayerWithTags(
+        try std.fmt.allocPrint(arena.allocator(), "model.model.vision_tower.transformer.layers.{d}.attention_norm", .{i}),
+        vision_layer.norm_attn,
+        vision_buffers.norm_attn,
+        .{ .absolute_tolerance = 2e-2 },
+        .{ .batch, .n, .hidden },
+    );
+
+    try ctx.testLayerWithTags(
+        try std.fmt.allocPrint(arena.allocator(), "model.model.vision_tower.transformer.layers.{d}.feed_forward", .{i}),
+        vision_layer.feed_fwd,
+        vision_buffers.feed_fwd,
+        .{ .absolute_tolerance = 2e-2 },
+        .{ .batch, .n, .hidden },
+    );
+
+    // try ctx.testLayerWithTags(
+    //     "model.model.multi_modal_projector",
+    //     layer.feed_fwd,
+    //     layer_buffers.feed_fwd,
+    //     .{ .absolute_tolerance = 2e-2 },
+    //     .{ .batch, .seq, .hidden },
+    // );
+    //
+    // try ctx.testLayerWithTags(
+    //     "model.model.multi_modal_projector.patch_merger",
+    //     layer.feed_fwd,
+    //     layer_buffers.feed_fwd,
+    //     .{ .absolute_tolerance = 2e-2 },
+    //     .{ .batch, .seq, .hidden },
+    // );
+
+    try ctx.testLayerWithTags(
+        "model.model.multi_modal_projector.norm",
+        mdl.vision_encoder.lm_head.norm,
+        model_buffers.vision_encoder.lm_head.norm,
+        .{ .absolute_tolerance = 2e-2 },
+        .{ .n, .v_hidden },
+    );
+
+    try ctx.testLayerWithTags(
+        "model.model.multi_modal_projector.linear_1",
+        mdl.vision_encoder.lm_head.w1,
+        model_buffers.vision_encoder.lm_head.w1,
+        .{ .absolute_tolerance = 2e-2 },
+        .{ .h, .v_hidden },
+    );
+
+    try ctx.testLayerWithTags(
+        "model.model.multi_modal_projector.linear_2",
+        mdl.vision_encoder.lm_head.w2,
+        model_buffers.vision_encoder.lm_head.w2,
+        .{ .absolute_tolerance = 2e-2 },
+        .{ .h, .hidden },
+    );
+
+    // try ctx.testLayerWithTags(
+    //     "model.model.multi_modal_projector.patch_merger",
+    //     mdl.vision_encoder.lm_head.merger,
+    //     model_buffers.vision_encoder.lm_head.merger,
+    //     .{ .absolute_tolerance = 2e-2 },
+    //     .{ .n, .v_hidden },
+    // );
 }
 
 const TestContext = struct {

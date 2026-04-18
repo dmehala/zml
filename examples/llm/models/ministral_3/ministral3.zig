@@ -289,38 +289,95 @@ const ViTLayer = struct {
             self.v_proj.weight.deinit();
             self.o_proj.weight.deinit();
         }
+
+        pub fn forward(
+            self: Attention,
+            x: zml.Tensor,
+            token_index: zml.Tensor,
+            attention_metadata: zml.attention.attention.Metadata,
+            attention_parameters: zml.attention.attention.Parameters,
+        ) zml.Tensor {
+            var q = self.q_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
+            var k = self.k_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
+            const v = self.v_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
+
+            const token_positions = b: {
+                const sh = token_index.shape().insert(.last, .{ .seq = x.dim(.seq) });
+                break :b zml.Tensor.iota(sh, .seq).convert(.u32).add(token_index.broad(sh));
+            };
+
+            q = zml.nn.rope(q, token_positions, self.rope_opts);
+            k = zml.nn.rope(k, token_positions, self.rope_opts);
+
+            const attn_scores = zml.attention.attention.attention(
+                q,
+                k,
+                v,
+                token_index,
+                attention_metadata,
+                attention_parameters,
+            );
+
+            const attn_heads = attn_scores.merge(.{ .d = .{ .h, .hd } });
+            return self.o_proj.forward(attn_heads).reuseBuffer(x);
+        }
     };
 
-    ffn_norm: zml.nn.LayerNorm,
+    ffn_norm: RMSNorm,
     self_attn: Attention,
-    norm_attn: zml.nn.LayerNorm,
+    norm_attn: RMSNorm,
     feed_fwd: Mlp,
 
     pub fn init(config: Config, store: zml.io.TensorStore.View) ViTLayer {
         return .{
             .ffn_norm = .{
-                .weight = store.withPrefix("ffn_norm").createTensor("weight", .{.hidden}, null),
+                .weights = store.withPrefix("ffn_norm").createTensor("weight", .{.hidden}, null),
                 .eps = config.text_config.rms_norm_eps,
+                .tag = zml.Shape.toTag(.hidden),
             },
             .self_attn = .init(config, store.withPrefix("attention")),
             .norm_attn = .{
-                .weight = store.withPrefix("attention_norm").createTensor("weight", .{.hidden}, null),
+                .weights = store.withPrefix("attention_norm").createTensor("weight", .{.hidden}, null),
                 .eps = config.text_config.rms_norm_eps,
+                .tag = zml.Shape.toTag(.hidden),
             },
             .feed_fwd = .init(store.withPrefix("feed_forward")),
         };
     }
 
     pub fn unloadBuffers(self: *zml.Bufferized(ViTLayer)) void {
-        self.ffn_norm.weight.deinit();
-        self.norm_attn.weight.deinit();
+        self.ffn_norm.weights.deinit();
+        self.norm_attn.weights.deinit();
         Attention.unloadBuffers(&self.self_attn);
         Mlp.unloadBuffers(&self.feed_fwd);
+    }
+
+    pub fn forward(self: ViTLayer, x: zml.Tensor) zml.Tensor {
+        _ = self; // autofix
+        return x;
+    }
+};
+
+const Conv2D = struct {
+    weight: zml.Tensor,
+    patch_size: i64,
+
+    pub fn init(weight: zml.Tensor, patch_size: i64) Conv2D {
+        return .{
+            .weight = weight,
+            .patch_size = patch_size,
+        };
+    }
+
+    pub fn forward(self: Conv2D, x: zml.Tensor) zml.Tensor {
+        return zml.Tensor.conv2d(x, self.weight, .{
+            .window_strides = &.{ self.patch_size, self.patch_size },
+        });
     }
 };
 
 const VisionTower = struct {
-    patch: zml.Tensor, // turns pixel into tokens
+    patch: Conv2D, // turns pixel into tokens
     ln_pre: RMSNorm, // stabilize before transformers
     layers: []ViTLayer, // transformers
 
@@ -332,7 +389,7 @@ const VisionTower = struct {
         }
 
         return .{
-            .patch = store.withPrefix("patch_conv").createTensor("weight", .{ .v_hidden, .channel, .pwidth, .pheight }, null),
+            .patch = .init(store.withPrefix("patch_conv").createTensor("weight", .{ .v_hidden, .channel, .pwidth, .pheight }, null), @intCast(config.vision_config.patch_size)),
             .ln_pre = .{
                 .weights = store.withPrefix("ln_pre").createTensor("weight", .{.hidden}, null),
                 .eps = config.text_config.rms_norm_eps,
@@ -352,32 +409,46 @@ const VisionTower = struct {
         }
         allocator.free(self.layers);
         self.ln_pre.weights.deinit();
-        self.patch.deinit();
+        self.patch.weight.deinit();
     }
 
     pub fn forward(self: VisionEncoder, input: zml.Tensor) zml.Tensor {
-        _ = self; // autofix
-        return input;
+        const pos_embeddings = input; //< TODO
+        var hidden = self.patch.forward(input).merge(.{ .n = .{ .pwidth, .pheight } }).add(pos_embeddings);
+        hidden = self.ln_pre.forward(hidden);
+
+        for (self.layers) |layer| {
+            hidden = layer.forward(hidden);
+        }
+
+        return hidden;
     }
 };
 
 const VisionEncoder = struct {
     const PatchMerger = struct {
-        weight: zml.Tensor,
+        merging_layer: zml.nn.Linear,
+        spatial_merge_size: u8,
 
-        pub fn init(store: zml.io.TensorStore.View) PatchMerger {
+        pub fn init(store: zml.io.TensorStore.View, config: Config) PatchMerger {
             return .{
-                .weight = store.withPrefix("merging_layer").createTensor("weight", .{ .v_hidden, .i }, null),
+                .merging_layer = .init(
+                    store.withPrefix("merging_layer").createTensor("weight", .{ .v_hidden, .i }, null),
+                    null,
+                    zml.Shape.toTag(.v_hidden),
+                ),
+                .spatial_merge_size = config.spatial_merge_size,
             };
         }
 
         pub fn unloadBuffers(self: *zml.Bufferized(PatchMerger)) void {
-            self.weight.deinit();
+            self.merging_layer.weight.deinit();
         }
 
         pub fn forward(self: PatchMerger, input: zml.Tensor) zml.Tensor {
-            _ = self; // autofix
-            return input;
+            // const tokens = input.
+            const h = input.split(.n, .{ .height, .weight });
+            return self.merging_layer.forward(h);
         }
     };
 
@@ -394,9 +465,9 @@ const VisionEncoder = struct {
                     .eps = config.text_config.rms_norm_eps,
                     .tag = zml.Shape.toTag(.v_hidden),
                 },
-                .w1 = .init(store.withPrefix("linear_1").createTensor("weight", .{ .hidden, .v_hidden }, null), null, .hidden),
-                .w2 = .init(store.withPrefix("linear_2").createTensor("weight", .{ .hidden, .hidden_2 }, null), null, .hidden),
-                .merger = .init(store.withPrefix("patch_merger")),
+                .w1 = .init(store.withPrefix("linear_1").createTensor("weight", .{ .int, .v_hidden }, null), null, .v_hidden),
+                .w2 = .init(store.withPrefix("linear_2").createTensor("weight", .{ .int, .hidden }, null), null, .hidden),
+                .merger = .init(store.withPrefix("patch_merger"), config),
             };
         }
 
