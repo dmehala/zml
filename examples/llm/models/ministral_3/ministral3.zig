@@ -27,6 +27,21 @@ const TextConfig = struct {
     vocab_size: u32,
 };
 
+const VisionConfig = struct {
+    attention_dropout: f32,
+    head_dim: u32,
+    hidden_act: []const u8,
+    hidden_size: u32,
+    image_size: u32,
+    initializer_range: f32,
+    intermediate_size: u32,
+    num_attention_heads: u8,
+    num_channels: u8,
+    num_hidden_layers: u32,
+    patch_size: u8,
+    rope_parameters: zml.nn.RopeOpts,
+};
+
 pub const Config = struct {
     architectures: []const []const u8,
     dtype: []const u8,
@@ -36,7 +51,7 @@ pub const Config = struct {
     projector_hidden_act: []const u8,
     spatial_merge_size: u8,
     text_config: TextConfig,
-    transformers_version: []const u8,
+    vision_config: VisionConfig,
 };
 
 const Self = @This();
@@ -51,6 +66,9 @@ norm_head: RMSNorm,
 lm_head: LmHead,
 
 sampling: zml.nn.SamplingStrategy,
+
+// Vision
+vision_encoder: VisionEncoder,
 
 const LmHead = struct {
     weight: zml.Tensor,
@@ -79,45 +97,34 @@ const RMSNorm = struct {
     }
 };
 
+const Mlp = struct {
+    down_proj: zml.nn.Linear,
+    gate_proj: zml.nn.Linear,
+    up_proj: zml.nn.Linear,
+
+    pub fn init(store: zml.io.TensorStore.View) Mlp {
+        return .{
+            .down_proj = .init(store.withPrefix("down_proj").createTensor("weight", .{ .hidden, .dout }, null), null, .dout),
+            .gate_proj = .init(store.withPrefix("gate_proj").createTensor("weight", .{ .dout, .hidden }, null), null, .hidden),
+            .up_proj = .init(store.withPrefix("up_proj").createTensor("weight", .{ .dout, .hidden }, null), null, .hidden),
+        };
+    }
+
+    pub fn unloadBuffers(self: *zml.Bufferized(Mlp)) void {
+        self.down_proj.weight.deinit();
+        self.gate_proj.weight.deinit();
+        self.up_proj.weight.deinit();
+    }
+
+    pub fn forward(self: Mlp, x: zml.Tensor) zml.Tensor {
+        const up = self.up_proj.forward(x);
+        var activated = self.gate_proj.forward(x);
+        activated = activated.silu().mul(up);
+        return self.down_proj.forward(activated);
+    }
+};
+
 const Layer = struct {
-    const Mlp = struct {
-        down_proj: zml.nn.Linear,
-        gate_proj: zml.nn.Linear,
-        up_proj: zml.nn.Linear,
-
-        pub fn init(store: zml.io.TensorStore.View) Mlp {
-            return .{
-                .down_proj = .init(store.withPrefix("down_proj").createTensor("weight", .{ .hidden, .dout }, null), null, .dout),
-                .gate_proj = .init(store.withPrefix("gate_proj").createTensor("weight", .{ .dout, .hidden }, null), null, .hidden),
-                .up_proj = .init(store.withPrefix("up_proj").createTensor("weight", .{ .dout, .hidden }, null), null, .hidden),
-            };
-        }
-
-        pub fn unloadBuffers(self: *zml.Bufferized(Mlp)) void {
-            self.down_proj.weight.deinit();
-            self.gate_proj.weight.deinit();
-            self.up_proj.weight.deinit();
-        }
-
-        pub fn forward(self: Mlp, x: zml.Tensor) zml.Tensor {
-            // def mlp(x):
-            // gate = x @ W_gate.T
-            // up   = x @ W_up.T
-            //
-            // # SwiGLU activation
-            // activated = silu(gate) * up
-            //
-            // out = activated @ W_down.T
-            //
-            // return out
-
-            const up = self.up_proj.forward(x);
-            var activated = self.gate_proj.forward(x);
-            activated = activated.silu().mul(up);
-            return self.down_proj.forward(activated);
-        }
-    };
-
     const Attention = struct {
         k_proj: zml.nn.Linear,
         q_proj: zml.nn.Linear,
@@ -247,6 +254,193 @@ const Layer = struct {
     }
 };
 
+// Full flow:
+// image
+// → patch_conv            # patchify + project
+// → flatten + permute     # to sequence
+// → add position embeddings (+ CLS token)
+// → ln_pre                # normalize before transformer
+// → transformer blocks
+// → (maybe ln_post / pooling)
+// → output features
+const ViTLayer = struct {
+    const Attention = struct {
+        k_proj: zml.nn.Linear,
+        q_proj: zml.nn.Linear,
+        v_proj: zml.nn.Linear,
+        o_proj: zml.nn.Linear,
+        rope_opts: zml.nn.RopeOpts,
+        head_dim: u32,
+
+        pub fn init(config: Config, store: zml.io.TensorStore.View) Attention {
+            return .{
+                .k_proj = .init(store.withPrefix("k_proj").createTensor("weight", .{ .e, .hidden }, null), null, .hidden),
+                .q_proj = .init(store.withPrefix("q_proj").createTensor("weight", .{ .dout, .hidden }, null), null, .hidden),
+                .v_proj = .init(store.withPrefix("v_proj").createTensor("weight", .{ .e, .hidden }, null), null, .hidden),
+                .o_proj = .init(store.withPrefix("o_proj").createTensor("weight", .{ .hidden, .d }, null), null, .d),
+                .rope_opts = config.vision_config.rope_parameters,
+                .head_dim = config.vision_config.head_dim,
+            };
+        }
+
+        pub fn unloadBuffers(self: *zml.Bufferized(Attention)) void {
+            self.k_proj.weight.deinit();
+            self.q_proj.weight.deinit();
+            self.v_proj.weight.deinit();
+            self.o_proj.weight.deinit();
+        }
+    };
+
+    ffn_norm: zml.nn.LayerNorm,
+    self_attn: Attention,
+    norm_attn: zml.nn.LayerNorm,
+    feed_fwd: Mlp,
+
+    pub fn init(config: Config, store: zml.io.TensorStore.View) ViTLayer {
+        return .{
+            .ffn_norm = .{
+                .weight = store.withPrefix("ffn_norm").createTensor("weight", .{.hidden}, null),
+                .eps = config.text_config.rms_norm_eps,
+            },
+            .self_attn = .init(config, store.withPrefix("attention")),
+            .norm_attn = .{
+                .weight = store.withPrefix("attention_norm").createTensor("weight", .{.hidden}, null),
+                .eps = config.text_config.rms_norm_eps,
+            },
+            .feed_fwd = .init(store.withPrefix("feed_forward")),
+        };
+    }
+
+    pub fn unloadBuffers(self: *zml.Bufferized(ViTLayer)) void {
+        self.ffn_norm.weight.deinit();
+        self.norm_attn.weight.deinit();
+        Attention.unloadBuffers(&self.self_attn);
+        Mlp.unloadBuffers(&self.feed_fwd);
+    }
+};
+
+const VisionTower = struct {
+    patch: zml.Tensor, // turns pixel into tokens
+    ln_pre: RMSNorm, // stabilize before transformers
+    layers: []ViTLayer, // transformers
+
+    pub fn init(allocator: std.mem.Allocator, store: zml.io.TensorStore.View, config: Config) !VisionTower {
+        const layers = try allocator.alloc(ViTLayer, config.vision_config.num_hidden_layers);
+        for (layers, 0..) |*layer, i| {
+            const layer_store = store.withPrefix("transformer.layers").withLayer(i);
+            layer.* = ViTLayer.init(config, layer_store);
+        }
+
+        return .{
+            .patch = store.withPrefix("patch_conv").createTensor("weight", .{ .v_hidden, .channel, .pwidth, .pheight }, null),
+            .ln_pre = .{
+                .weights = store.withPrefix("ln_pre").createTensor("weight", .{.hidden}, null),
+                .eps = config.text_config.rms_norm_eps,
+                .tag = zml.Shape.toTag(.hidden),
+            },
+            .layers = layers,
+        };
+    }
+
+    pub fn deinit(self: VisionTower, allocator: std.mem.Allocator) void {
+        allocator.free(self.layers);
+    }
+
+    pub fn unloadBuffers(self: *zml.Bufferized(VisionTower), allocator: std.mem.Allocator) void {
+        for (self.layers) |*layer| {
+            ViTLayer.unloadBuffers(layer);
+        }
+        allocator.free(self.layers);
+        self.ln_pre.weights.deinit();
+        self.patch.deinit();
+    }
+
+    pub fn forward(self: VisionEncoder, input: zml.Tensor) zml.Tensor {
+        _ = self; // autofix
+        return input;
+    }
+};
+
+const VisionEncoder = struct {
+    const PatchMerger = struct {
+        weight: zml.Tensor,
+
+        pub fn init(store: zml.io.TensorStore.View) PatchMerger {
+            return .{
+                .weight = store.withPrefix("merging_layer").createTensor("weight", .{ .v_hidden, .i }, null),
+            };
+        }
+
+        pub fn unloadBuffers(self: *zml.Bufferized(PatchMerger)) void {
+            self.weight.deinit();
+        }
+
+        pub fn forward(self: PatchMerger, input: zml.Tensor) zml.Tensor {
+            _ = self; // autofix
+            return input;
+        }
+    };
+
+    const MultiModalProjector = struct {
+        w1: zml.nn.Linear,
+        w2: zml.nn.Linear,
+        norm: RMSNorm,
+        merger: PatchMerger,
+
+        pub fn init(store: zml.io.TensorStore.View, config: Config) MultiModalProjector {
+            return .{
+                .norm = .{
+                    .weights = store.withPrefix("norm").createTensor("weight", .{.v_hidden}, null),
+                    .eps = config.text_config.rms_norm_eps,
+                    .tag = zml.Shape.toTag(.v_hidden),
+                },
+                .w1 = .init(store.withPrefix("linear_1").createTensor("weight", .{ .hidden, .v_hidden }, null), null, .hidden),
+                .w2 = .init(store.withPrefix("linear_2").createTensor("weight", .{ .hidden, .hidden_2 }, null), null, .hidden),
+                .merger = .init(store.withPrefix("patch_merger")),
+            };
+        }
+
+        pub fn unloadBuffers(self: *zml.Bufferized(MultiModalProjector)) void {
+            RMSNorm.unloadBuffers(&self.norm);
+            self.w1.weight.deinit();
+            self.w2.weight.deinit();
+            PatchMerger.unloadBuffers(&self.merger);
+        }
+
+        pub fn forward(self: MultiModalProjector, input: zml.Tensor) zml.Tensor {
+            var hidden = self.norm.forward(input);
+            hidden = self.merger.forward(hidden);
+            hidden = self.w1.forward(hidden);
+            hidden = self.w2.forward(hidden.gelu());
+            return hidden;
+        }
+    };
+
+    model: VisionTower,
+    lm_head: MultiModalProjector,
+
+    pub fn init(allocator: std.mem.Allocator, store: zml.io.TensorStore.View, config: Config) !VisionEncoder {
+        return .{
+            .model = try .init(allocator, store.withPrefix("vision_tower"), config),
+            .lm_head = .init(store.withPrefix("multi_modal_projector"), config),
+        };
+    }
+
+    pub fn deinit(self: VisionEncoder, allocator: std.mem.Allocator) void {
+        self.model.deinit(allocator);
+    }
+
+    pub fn unloadBuffers(self: *zml.Bufferized(VisionEncoder), allocator: std.mem.Allocator) void {
+        VisionTower.unloadBuffers(&self.model, allocator);
+        MultiModalProjector.unloadBuffers(&self.lm_head);
+    }
+
+    pub fn forward(self: VisionEncoder, input: zml.Tensor) zml.Tensor {
+        stdx.debug.assert(input.shape().hasTags(.{ .batch, .channel, .width, .height }), "Input should have tags {{.batch, .channel, .width, .height }} but got {f}", .{input.shape()});
+        return self.lm_head.forward(self.model.forward(input)).reuseBuffer(input);
+    }
+};
+
 pub fn init(
     allocator: std.mem.Allocator,
     store: zml.io.TensorStore.View,
@@ -276,10 +470,12 @@ pub fn init(
         },
         .lm_head = .{ .weight = embed_tokens },
         .sampling = opts.sampling_strategy,
+        .vision_encoder = try .init(allocator, store, config),
     };
 }
 
 pub fn deinit(self: Self, allocator: std.mem.Allocator) void {
+    self.vision_encoder.deinit(allocator);
     allocator.free(self.layers);
 }
 
@@ -321,6 +517,7 @@ pub fn unloadBuffers(self: *zml.Bufferized(Self), allocator: std.mem.Allocator) 
         Layer.unloadBuffers(layer);
     }
     LmHead.unloadBuffers(&self.lm_head);
+    VisionEncoder.unloadBuffers(&self.vision_encoder, allocator);
     allocator.free(self.layers);
 }
 

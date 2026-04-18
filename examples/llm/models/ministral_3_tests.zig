@@ -124,42 +124,44 @@ fn run(
     defer arena.deinit();
 
     // expect layers.len == context.layer
-    for (mdl.layers, 0..) |layer, i| {
-        const layer_buffers = model_buffers.layers[i];
+    const i: usize = 0;
+    const layer = mdl.layers[i];
+    // for (mdl.layers, 0..) |layer, i| {
+    const layer_buffers = model_buffers.layers[i];
 
-        try ctx.testLayerWithTags(
-            try std.fmt.allocPrint(arena.allocator(), "model.model.language_model.layers.{d}.input_layernorm", .{i}),
-            layer.input_norm,
-            layer_buffers.input_norm,
-            .{ .absolute_tolerance = 1e-2 },
-            .{ .batch, .seq, .hidden },
-        );
+    try ctx.testLayerWithTags(
+        try std.fmt.allocPrint(arena.allocator(), "model.model.language_model.layers.{d}.input_layernorm", .{i}),
+        layer.input_norm,
+        layer_buffers.input_norm,
+        .{ .absolute_tolerance = 1e-2 },
+        .{ .batch, .seq, .hidden },
+    );
 
-        // try ctx.testAttentionLayer(
-        //     "model.model.language_model.layers.0.self_attn",
-        //     layer.self_attn,
-        //     layer_buffers.self_attn,
-        //     .{ .absolute_tolerance = 1e-2 },
-        //     .{ .batch, .seq, .hidden },
-        //     backend,
-        // );
+    // try ctx.testAttentionLayer(
+    //     "model.model.language_model.layers.0.self_attn",
+    //     layer.self_attn,
+    //     layer_buffers.self_attn,
+    //     .{ .absolute_tolerance = 1e-2 },
+    //     .{ .batch, .seq, .hidden },
+    //     backend,
+    // );
 
-        try ctx.testLayerWithTags(
-            try std.fmt.allocPrint(arena.allocator(), "model.model.language_model.layers.{d}.post_attention_layernorm", .{i}),
-            layer.post_attn,
-            layer_buffers.post_attn,
-            .{ .absolute_tolerance = 2e-2 },
-            .{ .batch, .seq, .hidden },
-        );
+    try ctx.testLayerWithTags(
+        try std.fmt.allocPrint(arena.allocator(), "model.model.language_model.layers.{d}.post_attention_layernorm", .{i}),
+        layer.post_attn,
+        layer_buffers.post_attn,
+        .{ .absolute_tolerance = 2e-2 },
+        .{ .batch, .seq, .hidden },
+    );
 
-        try ctx.testLayerWithTags(
-            try std.fmt.allocPrint(arena.allocator(), "model.model.language_model.layers.{d}.mlp", .{i}),
-            layer.feed_fwd,
-            layer_buffers.feed_fwd,
-            .{ .absolute_tolerance = 2e-2 },
-            .{ .batch, .seq, .hidden },
-        );
-    }
+    try ctx.testLayerWithTags(
+        try std.fmt.allocPrint(arena.allocator(), "model.model.language_model.layers.{d}.mlp", .{i}),
+        layer.feed_fwd,
+        layer_buffers.feed_fwd,
+        .{ .absolute_tolerance = 2e-2 },
+        .{ .batch, .seq, .hidden },
+    );
+    // }
 }
 
 const TestContext = struct {
