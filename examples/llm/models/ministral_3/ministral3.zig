@@ -269,7 +269,6 @@ const ViTLayer = struct {
         q_proj: zml.nn.Linear,
         v_proj: zml.nn.Linear,
         o_proj: zml.nn.Linear,
-        rope_opts: zml.nn.RopeOpts,
         head_dim: u32,
 
         pub fn init(config: Config, store: zml.io.TensorStore.View) Attention {
@@ -278,7 +277,6 @@ const ViTLayer = struct {
                 .q_proj = .init(store.withPrefix("q_proj").createTensor("weight", .{ .dout, .hidden }, null), null, .hidden),
                 .v_proj = .init(store.withPrefix("v_proj").createTensor("weight", .{ .e, .hidden }, null), null, .hidden),
                 .o_proj = .init(store.withPrefix("o_proj").createTensor("weight", .{ .hidden, .d }, null), null, .d),
-                .rope_opts = config.vision_config.rope_parameters,
                 .head_dim = config.vision_config.head_dim,
             };
         }
@@ -297,17 +295,9 @@ const ViTLayer = struct {
             attention_metadata: zml.attention.attention.Metadata,
             attention_parameters: zml.attention.attention.Parameters,
         ) zml.Tensor {
-            var q = self.q_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
-            var k = self.k_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
+            const q = self.q_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
+            const k = self.k_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
             const v = self.v_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
-
-            const token_positions = b: {
-                const sh = token_index.shape().insert(.last, .{ .seq = x.dim(.seq) });
-                break :b zml.Tensor.iota(sh, .seq).convert(.u32).add(token_index.broad(sh));
-            };
-
-            q = zml.nn.rope(q, token_positions, self.rope_opts);
-            k = zml.nn.rope(k, token_positions, self.rope_opts);
 
             const attn_scores = zml.attention.attention.attention(
                 q,
@@ -352,9 +342,17 @@ const ViTLayer = struct {
         Mlp.unloadBuffers(&self.feed_fwd);
     }
 
-    pub fn forward(self: ViTLayer, x: zml.Tensor) zml.Tensor {
-        _ = self; // autofix
-        return x;
+    pub fn forward(
+        self: ViTLayer,
+        x: zml.Tensor,
+        position_embeddings: zml.Tensor,
+        attention_metadata: zml.attention.attention.Metadata,
+        attention_parameters: zml.attention.attention.Parameters,
+    ) zml.Tensor {
+        var r = self.self_attn.forward(self.norm_attn.forward(x), position_embeddings, attention_metadata, attention_parameters);
+        const h = x.add(r);
+        r = self.feed_fwd.forward(self.ffn_norm.forward(h));
+        return h.add(r);
     }
 };
 
@@ -380,6 +378,7 @@ const VisionTower = struct {
     patch: Conv2D, // turns pixel into tokens
     ln_pre: RMSNorm, // stabilize before transformers
     layers: []ViTLayer, // transformers
+    rope_opts: zml.nn.RopeOpts,
 
     pub fn init(allocator: std.mem.Allocator, store: zml.io.TensorStore.View, config: Config) !VisionTower {
         const layers = try allocator.alloc(ViTLayer, config.vision_config.num_hidden_layers);
@@ -396,6 +395,7 @@ const VisionTower = struct {
                 .tag = zml.Shape.toTag(.hidden),
             },
             .layers = layers,
+            .rope_opts = config.vision_config.rope_parameters,
         };
     }
 
@@ -412,15 +412,29 @@ const VisionTower = struct {
         self.patch.weight.deinit();
     }
 
-    pub fn forward(self: VisionEncoder, input: zml.Tensor) zml.Tensor {
-        const pos_embeddings = input; //< TODO
-        var hidden = self.patch.forward(input).merge(.{ .n = .{ .pwidth, .pheight } }).add(pos_embeddings);
+    pub fn forward(
+        self: VisionTower,
+        input: zml.Tensor,
+        attention_metadata: zml.attention.attention.Metadata,
+        attention_parameters: zml.attention.attention.Parameters,
+    ) zml.Tensor {
+        var hidden = self.patch.forward(input).merge(.{ .n = .{ .pwidth, .pheight } });
         hidden = self.ln_pre.forward(hidden);
 
+        // todo
+        const position_idx = input;
+        const position_embeddings = zml.nn.rope(hidden, position_idx, self.rope_opts);
+
         for (self.layers) |layer| {
-            hidden = layer.forward(hidden);
+            hidden = layer.forward(
+                hidden,
+                position_embeddings,
+                attention_metadata,
+                attention_parameters,
+            );
         }
 
+        // Do we need to impl `resolve_visual_encoder_outputs`?
         return hidden;
     }
 };
@@ -446,7 +460,6 @@ const VisionEncoder = struct {
         }
 
         pub fn forward(self: PatchMerger, input: zml.Tensor) zml.Tensor {
-            // const tokens = input.
             const h = input.split(.n, .{ .height, .weight });
             return self.merging_layer.forward(h);
         }
