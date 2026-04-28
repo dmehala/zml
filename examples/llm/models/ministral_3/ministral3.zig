@@ -449,7 +449,7 @@ const VisionEncoder = struct {
                 .merging_layer = .init(
                     store.withPrefix("merging_layer").createTensor("weight", .{ .v_hidden, .i }, null),
                     null,
-                    zml.Shape.toTag(.v_hidden),
+                    zml.Shape.toTag(.i),
                 ),
                 .spatial_merge_size = config.spatial_merge_size,
             };
@@ -460,7 +460,11 @@ const VisionEncoder = struct {
         }
 
         pub fn forward(self: PatchMerger, input: zml.Tensor) zml.Tensor {
-            const h = input.split(.n, .{ .height, .weight });
+            var h = input.splitAxis(.n, .{ .height = 28, .weight = .auto });
+            h = h.splitAxis(.height, .{ .ph = .auto, .nh = self.spatial_merge_size });
+            h = h.splitAxis(.weight, .{ .pw = .auto, .nw = self.spatial_merge_size });
+            h = h.transpose(.{ .ph, .pw, .v_hidden, .nh, .nw });
+            h = h.merge(.{ .n = .{ .ph, .pw }, .i = .{ .v_hidden, .nh, .nw } });
             return self.merging_layer.forward(h);
         }
     };
@@ -478,8 +482,8 @@ const VisionEncoder = struct {
                     .eps = config.text_config.rms_norm_eps,
                     .tag = zml.Shape.toTag(.v_hidden),
                 },
-                .w1 = .init(store.withPrefix("linear_1").createTensor("weight", .{ .int, .v_hidden }, null), null, .v_hidden),
-                .w2 = .init(store.withPrefix("linear_2").createTensor("weight", .{ .int, .hidden }, null), null, .hidden),
+                .w1 = .init(store.withPrefix("linear_1").createTensor("weight", .{ .i, .v_hidden }, null), null, .v_hidden),
+                .w2 = .init(store.withPrefix("linear_2").createTensor("weight", .{ .s, .i }, null), null, .i),
                 .merger = .init(store.withPrefix("patch_merger"), config),
             };
         }

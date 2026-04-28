@@ -253,16 +253,24 @@ fn run(
         mdl.vision_encoder.lm_head.w2,
         model_buffers.vision_encoder.lm_head.w2,
         .{ .absolute_tolerance = 2e-2 },
-        .{ .h, .hidden },
+        .{ .h, .i },
     );
 
-    // try ctx.testLayerWithTags(
-    //     "model.model.multi_modal_projector.patch_merger",
-    //     mdl.vision_encoder.lm_head.merger,
-    //     model_buffers.vision_encoder.lm_head.merger,
-    //     .{ .absolute_tolerance = 2e-2 },
-    //     .{ .n, .v_hidden },
-    // );
+    try ctx.testLayerWithTags(
+        "model.model.multi_modal_projector.patch_merger",
+        mdl.vision_encoder.lm_head.merger,
+        model_buffers.vision_encoder.lm_head.merger,
+        .{ .absolute_tolerance = 2e-2 },
+        .{ .n, .v_hidden },
+    );
+
+    try ctx.testLayerWithTags(
+        "model.model.multi_modal_projector",
+        mdl.vision_encoder.lm_head,
+        model_buffers.vision_encoder.lm_head,
+        .{ .absolute_tolerance = 2e-2 },
+        .{ .n, .v_hidden },
+    );
 }
 
 const TestContext = struct {
