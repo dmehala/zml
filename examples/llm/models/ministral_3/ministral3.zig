@@ -370,7 +370,6 @@ const ViTLayer = struct {
 
             q = self.rope.apply(q, token_positions);
             k = self.rope.apply(k, token_positions);
-            q.print("q");
 
             q = q.rename(.{ .n = .q });
             k = k.rename(.{ .n = .k });
@@ -445,9 +444,9 @@ const Conv2D = struct {
     }
 
     pub fn forward(self: Conv2D, x: zml.Tensor) zml.Tensor {
-        return zml.Tensor.conv2d(x, self.weight, .{
+        return zml.Tensor.conv2d(x.convert(self.weight.dtype()), self.weight, .{
             .window_strides = &.{ self.patch_size, self.patch_size },
-        });
+        }).renameTag(.channel, .hidden);
     }
 };
 
@@ -495,11 +494,12 @@ const VisionTower = struct {
         attention_metadata: zml.attention.attention.Metadata,
         attention_parameters: zml.attention.attention.Parameters,
     ) zml.Tensor {
-        const width = input.dim(.width);
-        const height = input.dim(.height);
+        var hidden = self.patch.forward(input);
 
-        var hidden = self.patch.forward(input).merge(.{ .n = .{ .pwidth, .pheight } });
-        hidden = self.ln_pre.forward(hidden);
+        const width = hidden.dim(.width);
+        const height = hidden.dim(.height);
+
+        hidden = self.ln_pre.forward(hidden.merge(.{ .n = .{ .width, .height } }).swapAxes(.n, .hidden));
 
         const position_ids = b: {
             const x = zml.Tensor.iota(.init(.{ .n = width }, input.dtype()), .n);
@@ -530,7 +530,7 @@ const VisionEncoder = struct {
         pub fn init(store: zml.io.TensorStore.View, config: Config) PatchMerger {
             return .{
                 .merging_layer = .init(
-                    store.withPrefix("merging_layer").createTensor("weight", .{ .v_hidden, .i }, null),
+                    store.withPrefix("merging_layer").createTensor("weight", .{ .hidden, .i }, null),
                     null,
                     zml.Shape.toTag(.i),
                 ),
@@ -547,8 +547,8 @@ const VisionEncoder = struct {
             var h = input.splitAxis(.n, .{ .height = 28, .weight = .auto });
             h = h.splitAxis(.height, .{ .ph = .auto, .nh = self.spatial_merge_size });
             h = h.splitAxis(.weight, .{ .pw = .auto, .nw = self.spatial_merge_size });
-            h = h.transpose(.{ .ph, .pw, .v_hidden, .nh, .nw });
-            h = h.merge(.{ .n = .{ .ph, .pw }, .i = .{ .v_hidden, .nh, .nw } });
+            h = h.transpose(.{ .batch, .ph, .pw, .hidden, .nh, .nw });
+            h = h.merge(.{ .n = .{ .ph, .pw }, .i = .{ .hidden, .nh, .nw } });
             return self.merging_layer.forward(h);
         }
     };
@@ -562,11 +562,11 @@ const VisionEncoder = struct {
         pub fn init(store: zml.io.TensorStore.View, config: Config) MultiModalProjector {
             return .{
                 .norm = .{
-                    .weights = store.withPrefix("norm").createTensor("weight", .{.v_hidden}, null),
+                    .weights = store.withPrefix("norm").createTensor("weight", .{.hidden}, null),
                     .eps = config.text_config.rms_norm_eps,
-                    .tag = zml.Shape.toTag(.v_hidden),
+                    .tag = zml.Shape.toTag(.hidden),
                 },
-                .w1 = .init(store.withPrefix("linear_1").createTensor("weight", .{ .i, .v_hidden }, null), null, .v_hidden),
+                .w1 = .init(store.withPrefix("linear_1").createTensor("weight", .{ .i, .hidden }, null), null, .hidden),
                 .w2 = .init(store.withPrefix("linear_2").createTensor("weight", .{ .s, .i }, null), null, .i),
                 .merger = .init(store.withPrefix("patch_merger"), config),
             };
@@ -614,7 +614,7 @@ const VisionEncoder = struct {
         attention_parameters: zml.attention.attention.Parameters,
     ) zml.Tensor {
         stdx.debug.assert(input.shape().hasTags(.{ .batch, .channel, .width, .height }), "Input should have tags {{.batch, .channel, .width, .height }} but got {f}", .{input.shape()});
-        return self.lm_head.forward(self.model.forward(input, attention_metadata, attention_parameters)).reuseBuffer(input);
+        return self.lm_head.forward(self.model.forward(input, attention_metadata, attention_parameters));
     }
 };
 

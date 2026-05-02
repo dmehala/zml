@@ -15,6 +15,9 @@ pub const CompilationOptions = struct {
     kv_cache: Ministral3.KvCache,
     attention_metadata: zml.attention.attention.Metadata,
     attention_parameters: zml.attention.attention.Parameters,
+    channel: u32,
+    width: u32,
+    height: u32,
 
     pub fn init(config: Ministral3.Config, model: Ministral3, shardings: common.Shardings, backend: zml.attention.attention.Backend, seqlen: usize) CompilationOptions {
         const batch_dim = 1;
@@ -26,6 +29,9 @@ pub const CompilationOptions = struct {
             .kv_cache = .init(config, model, batch_dim, seqlen),
             .attention_metadata = .init(.fromBackend(backend, @intCast(seqlen), @intCast(config.text_config.num_attention_heads))),
             .attention_parameters = .init(.fromBackend(backend)),
+            .channel = 3,
+            .width = 392,
+            .height = 532,
         };
     }
 };
@@ -33,6 +39,7 @@ pub const CompilationOptions = struct {
 pub const CompiledModel = struct {
     prefill: KernelExe,
     decode: KernelExe,
+    vision: KernelExe,
     params: CompilationOptions,
 
     pub fn init(
@@ -44,6 +51,7 @@ pub const CompiledModel = struct {
         progress: *std.Progress.Node,
     ) !CompiledModel {
         return .{
+            .vision = try compileVisionKernel(allocator, io, platform, model, opts.shardings, opts, progress),
             .prefill = try compileKernel(allocator, io, platform, model, opts.shardings, opts, progress),
             .decode = try compileDecoderKernel(allocator, io, platform, model, opts.shardings, opts, progress),
             .params = opts,
@@ -106,6 +114,31 @@ fn compileDecoderKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml
             token_position_offset,
             opts.rng,
             opts.kv_cache,
+            opts.attention_metadata,
+            opts.attention_parameters,
+        },
+        .{ .shardings = &all_shardings },
+    );
+    return .{ .exe = exe };
+}
+
+fn compileVisionKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platform, model: Ministral3, shardings: common.Shardings, opts: CompilationOptions, progress: *std.Progress.Node) !KernelExe {
+    progress.increaseEstimatedTotalItems(1);
+    var node = progress.start("Compiling vision kernel...", 1);
+    defer node.end();
+    const now: std.Io.Timestamp = .now(io, .awake);
+    defer log.info("Compiled vision kernel [{f}]", .{now.untilNow(io, .awake)});
+
+    const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .channel = opts.channel, .width = opts.width, .height = opts.height }, .u32);
+
+    const all_shardings = shardings.all();
+    const exe = try platform.compile(
+        allocator,
+        io,
+        model.vision_encoder,
+        .forward,
+        .{
+            tokens,
             opts.attention_metadata,
             opts.attention_parameters,
         },
