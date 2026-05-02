@@ -181,6 +181,13 @@ fn run(
         .{ .batch, .n, .hidden },
     );
 
+    // try ctx.testPositionEmbeddings(
+    //     "model.model.vision_tower.patch_positional_embedding",
+    //     mdl.vision_encoder.model.rope,
+    //     .{ .absolute_tolerance = 2e-4 },
+    //     .{.n},
+    // );
+
     const vision_layer = mdl.vision_encoder.model.layers[0];
     const vision_buffers = model_buffers.vision_encoder.model.layers[0];
 
@@ -192,7 +199,7 @@ fn run(
         .{ .batch, .n, .hidden },
     );
 
-    // try ctx.testLayerWithTags(
+    // try ctx.testViTAttentionLayer(
     //     try std.fmt.allocPrint(arena.allocator(), "model.model.vision_tower.transformer.layers.{d}.attention", .{i}),
     //     vision_layer.self_attn,
     //     vision_buffers.self_attn,
@@ -215,22 +222,6 @@ fn run(
         .{ .absolute_tolerance = 2e-2 },
         .{ .batch, .n, .hidden },
     );
-
-    // try ctx.testLayerWithTags(
-    //     "model.model.multi_modal_projector",
-    //     layer.feed_fwd,
-    //     layer_buffers.feed_fwd,
-    //     .{ .absolute_tolerance = 2e-2 },
-    //     .{ .batch, .seq, .hidden },
-    // );
-    //
-    // try ctx.testLayerWithTags(
-    //     "model.model.multi_modal_projector.patch_merger",
-    //     layer.feed_fwd,
-    //     layer_buffers.feed_fwd,
-    //     .{ .absolute_tolerance = 2e-2 },
-    //     .{ .batch, .seq, .hidden },
-    // );
 
     try ctx.testLayerWithTags(
         "model.model.multi_modal_projector.norm",
@@ -354,6 +345,51 @@ const TestContext = struct {
         try zml.testing.expectClose(self.io, out_result, out_buffer_expected, opts);
     }
 
+    fn testPositionEmbeddings(
+        self: TestContext,
+        name: []const u8,
+        layer: anytype,
+        opts: zml.testing.CompareOpts,
+        tags: anytype,
+    ) !void {
+        const in_key = try std.fmt.allocPrint(self.allocator, "{s}.in.1", .{name});
+        defer self.allocator.free(in_key);
+
+        const in_shape = self.activation_store.getShape(in_key) orelse return error.NotFound;
+        var in_buffer = try loadBufferFromStore(self.allocator, self.io, self.platform, self.activation_store, in_key, self.sharding);
+        defer in_buffer.deinit();
+        const in_tensor = zml.Tensor.fromShape(in_shape).withTags(tags);
+
+        const out_key = try std.fmt.allocPrint(self.allocator, "{s}.out.0", .{name});
+        defer self.allocator.free(out_key);
+        var out_cos_buffer_expected = try loadBufferFromStore(self.allocator, self.io, self.platform, self.activation_store, out_key, self.sharding);
+        defer out_cos_buffer_expected.deinit();
+
+        const out_sin_key = try std.fmt.allocPrint(self.allocator, "{s}.out.1", .{name});
+        defer self.allocator.free(out_sin_key);
+        var out_sin_buffer_expected = try loadBufferFromStore(self.allocator, self.io, self.platform, self.activation_store, out_sin_key, self.sharding);
+        defer out_sin_buffer_expected.deinit();
+
+        const exe = try self.platform.compileFn(self.allocator, self.io, @TypeOf(layer).forward, .{ layer, in_tensor }, .{ .shardings = &.{self.sharding} });
+        defer exe.deinit();
+
+        var args = try exe.args(self.allocator);
+        defer args.deinit(self.allocator);
+        args.set(.{in_buffer});
+
+        var res = try exe.results(self.allocator);
+        defer res.deinit(self.allocator);
+
+        exe.call(args, &res);
+
+        var out_cos, var out_sin = res.get(struct { zml.Buffer, zml.Buffer });
+        defer out_cos.deinit();
+        defer out_sin.deinit();
+
+        try zml.testing.expectClose(self.io, out_cos, out_cos_buffer_expected, opts);
+        try zml.testing.expectClose(self.io, out_sin, out_sin_buffer_expected, opts);
+    }
+
     fn testAttentionLayer(
         self: TestContext,
         name: []const u8,
@@ -402,6 +438,57 @@ const TestContext = struct {
         var args = try exe.args(self.allocator);
         defer args.deinit(self.allocator);
         args.set(.{ layer_weights, in_buffer });
+
+        var res = try exe.results(self.allocator);
+        defer res.deinit(self.allocator);
+
+        exe.call(args, &res);
+
+        var out_result = res.get(zml.Buffer);
+        defer out_result.deinit();
+        try zml.testing.expectClose(self.io, out_result, out_buffer_expected, opts);
+    }
+
+    fn testViTAttentionLayer(
+        self: TestContext,
+        name: []const u8,
+        layer: anytype,
+        layer_weights: zml.Bufferized(@TypeOf(layer)),
+        opts: zml.testing.CompareOpts,
+        tags: anytype,
+    ) !void {
+        const in_key = try std.fmt.allocPrint(self.allocator, "{s}.in.0", .{name});
+        defer self.allocator.free(in_key);
+
+        const in_shape = self.activation_store.getShape(in_key) orelse return error.NotFound;
+        var in_buffer = try loadBufferFromStore(self.allocator, self.io, self.platform, self.activation_store, in_key, self.sharding);
+        defer in_buffer.deinit();
+        const in_tensor = zml.Tensor.fromShape(in_shape).withTags(tags);
+
+        const out_key = try std.fmt.allocPrint(self.allocator, "{s}.out.0", .{name});
+        defer self.allocator.free(out_key);
+        var out_buffer_expected = try loadBufferFromStore(self.allocator, self.io, self.platform, self.activation_store, out_key, self.sharding);
+        defer out_buffer_expected.deinit();
+
+        const seqlen = 11;
+        const attention_heads = 64;
+
+        const pos_embds = "model.model.vision_tower.patch_positional_embedding.in.1";
+        const pos_shape = self.activation_store.getShape(pos_embds) orelse return error.NotFound;
+
+        const token_index = zml.Tensor.fromShape(pos_shape);
+        var token_index_buf = try loadBufferFromStore(self.allocator, self.io, self.platform, self.activation_store, pos_embds, self.sharding);
+        defer token_index_buf.deinit();
+
+        const attention_metadata: zml.attention.attention.Metadata = .init(.fromBackend(self.backend, seqlen, attention_heads));
+        const attention_params: zml.attention.attention.Parameters = .init(.fromBackend(self.backend));
+
+        const exe = try self.platform.compileFn(self.allocator, self.io, @TypeOf(layer).forward, .{ layer, in_tensor, token_index, attention_metadata, attention_params }, .{ .shardings = &.{self.sharding} });
+        defer exe.deinit();
+
+        var args = try exe.args(self.allocator);
+        defer args.deinit(self.allocator);
+        args.set(.{ layer_weights, in_buffer, token_index_buf });
 
         var res = try exe.results(self.allocator);
         defer res.deinit(self.allocator);

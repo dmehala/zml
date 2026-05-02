@@ -254,6 +254,73 @@ const Layer = struct {
     }
 };
 
+fn outer1d(lhs: zml.Tensor, rhs: zml.Tensor) zml.Tensor {
+    stdx.debug.assert(lhs.rank() == 1, "expected lhs rank to be 1 but got {d}", .{lhs.rank()});
+    stdx.debug.assert(rhs.rank() == 1, "expected rhs rank to be 1 but got {d}", .{rhs.rank()});
+
+    const target_shape = lhs.shape().insert(.last, .{rhs.dim(0)});
+    return lhs.reshape(.{ lhs.dim(0), 1 }).broad(target_shape).mul(rhs.reshape(.{ 1, rhs.dim(0) }).broad(target_shape));
+}
+
+const RotaryEmbedding = struct {
+    opts: zml.nn.RopeOpts,
+    max_patches: u32,
+    n_head: u32,
+
+    pub fn init(config: Config) RotaryEmbedding {
+        return .{
+            .opts = config.vision_config.rope_parameters,
+            .max_patches = @divExact(config.vision_config.image_size, config.vision_config.patch_size),
+            .n_head = config.vision_config.head_dim,
+        };
+    }
+
+    pub fn forward(self: RotaryEmbedding, pos_ids: zml.Tensor) struct { zml.Tensor, zml.Tensor } {
+        const inv_freq = self.invFreq(self.n_head);
+        const emb = inv_freq.gather(.{ .dh = pos_ids }, .{});
+
+        const cos = emb.cos().convert(.bf16);
+        const sin = emb.sin().convert(.bf16);
+
+        return .{ cos, sin };
+    }
+
+    pub fn apply(self: RotaryEmbedding, x: zml.Tensor, pos_ids: zml.Tensor) zml.Tensor {
+        var cos, var sin = self.forward(pos_ids);
+
+        const s = x.shape();
+        cos = cos.reshape(.{ 1, cos.dim(0), 1, cos.dim(1) }).broad(s);
+        sin = sin.reshape(.{ 1, sin.dim(0), 1, sin.dim(1) }).broad(s);
+
+        return x.mul(cos).add(rotateHalf(x).mul(sin));
+    }
+
+    fn rotateHalf(x: zml.Tensor) zml.Tensor {
+        const half_dim = @divExact(x.dim(-1), 2);
+        const x1 = x.slice1d(-1, .{ .start = 0, .end = half_dim });
+        const x2 = x.slice1d(-1, .{ .start = half_dim, .end = x.dim(-1) });
+        return zml.Tensor.concatenate(&.{ x2.negate(), x1 }, -1);
+    }
+
+    fn invFreq(self: RotaryEmbedding, N: i64) zml.Tensor {
+        const freqs = b: {
+            const norm = zml.Tensor.arange(.{ .start = 0, .end = N, .step = 2 }, .f32).divByConst(N);
+            const dist = zml.Tensor.scalar(self.opts.scaling.getRopeTheta(), .f32).pow(norm);
+            break :b zml.Tensor.scalar(1.0, .f32).div(dist);
+        };
+
+        const freq_h = outer1d(zml.Tensor.arange(.{ .end = self.max_patches }, .f32), freqs.slice1d(0, .{ .step = 2 }));
+        const freq_w = outer1d(zml.Tensor.arange(.{ .end = self.max_patches }, .f32), freqs.slice1d(0, .{ .start = 1, .step = 2 }));
+
+        const inv_freq = zml.Tensor.concatenate(&.{
+            freq_h.insertAxes(1, .{.c}).broad(freq_h.shape().insert(0, .{freq_h.dim(0)})),
+            freq_w.insertAxes(1, .{.c}).broad(freq_w.shape().insert(0, .{freq_w.dim(0)})),
+        }, -1).merge(.{ .dh = .{ 0, 1 } });
+
+        return zml.Tensor.concatenate(&.{ inv_freq, inv_freq }, -1);
+    }
+};
+
 // Full flow:
 // image
 // → patch_conv            # patchify + project
@@ -270,6 +337,7 @@ const ViTLayer = struct {
         v_proj: zml.nn.Linear,
         o_proj: zml.nn.Linear,
         head_dim: u32,
+        rope: RotaryEmbedding,
 
         pub fn init(config: Config, store: zml.io.TensorStore.View) Attention {
             return .{
@@ -278,6 +346,7 @@ const ViTLayer = struct {
                 .v_proj = .init(store.withPrefix("v_proj").createTensor("weight", .{ .e, .hidden }, null), null, .hidden),
                 .o_proj = .init(store.withPrefix("o_proj").createTensor("weight", .{ .hidden, .d }, null), null, .d),
                 .head_dim = config.vision_config.head_dim,
+                .rope = .init(config),
             };
         }
 
@@ -291,19 +360,27 @@ const ViTLayer = struct {
         pub fn forward(
             self: Attention,
             x: zml.Tensor,
-            token_index: zml.Tensor,
+            token_positions: zml.Tensor,
             attention_metadata: zml.attention.attention.Metadata,
             attention_parameters: zml.attention.attention.Parameters,
         ) zml.Tensor {
-            const q = self.q_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
-            const k = self.k_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
-            const v = self.v_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
+            var q = self.q_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
+            var k = self.k_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
+            var v = self.v_proj.forward(x).splitAxis(-1, .{ .h = .auto, .hd = self.head_dim });
+
+            q = self.rope.apply(q, token_positions);
+            k = self.rope.apply(k, token_positions);
+            q.print("q");
+
+            q = q.rename(.{ .n = .q });
+            k = k.rename(.{ .n = .k });
+            v = v.rename(.{ .n = .k });
 
             const attn_scores = zml.attention.attention.attention(
                 q,
                 k,
                 v,
-                token_index,
+                zml.Tensor.scalar(@as(u32, 0), .u32),
                 attention_metadata,
                 attention_parameters,
             );
@@ -378,7 +455,7 @@ const VisionTower = struct {
     patch: Conv2D, // turns pixel into tokens
     ln_pre: RMSNorm, // stabilize before transformers
     layers: []ViTLayer, // transformers
-    rope_opts: zml.nn.RopeOpts,
+    max_width: u32,
 
     pub fn init(allocator: std.mem.Allocator, store: zml.io.TensorStore.View, config: Config) !VisionTower {
         const layers = try allocator.alloc(ViTLayer, config.vision_config.num_hidden_layers);
@@ -395,7 +472,7 @@ const VisionTower = struct {
                 .tag = zml.Shape.toTag(.hidden),
             },
             .layers = layers,
-            .rope_opts = config.vision_config.rope_parameters,
+            .max_width = @divExact(config.vision_config.image_size, config.vision_config.patch_size),
         };
     }
 
@@ -418,17 +495,23 @@ const VisionTower = struct {
         attention_metadata: zml.attention.attention.Metadata,
         attention_parameters: zml.attention.attention.Parameters,
     ) zml.Tensor {
+        const width = input.dim(.width);
+        const height = input.dim(.height);
+
         var hidden = self.patch.forward(input).merge(.{ .n = .{ .pwidth, .pheight } });
         hidden = self.ln_pre.forward(hidden);
 
-        // todo
-        const position_idx = input;
-        const position_embeddings = zml.nn.rope(hidden, position_idx, self.rope_opts);
+        const position_ids = b: {
+            const x = zml.Tensor.iota(.init(.{ .n = width }, input.dtype()), .n);
+            const y = zml.Tensor.iota(.init(.{ .n = height }, input.dtype()), .n);
+            const row, const col = zml.Tensor.cartesianProduct(2, .{ x, y });
+            break :b row.scale(self.max_width).add(col).flatten();
+        };
 
         for (self.layers) |layer| {
             hidden = layer.forward(
                 hidden,
-                position_embeddings,
+                position_ids,
                 attention_metadata,
                 attention_parameters,
             );
@@ -460,6 +543,7 @@ const VisionEncoder = struct {
         }
 
         pub fn forward(self: PatchMerger, input: zml.Tensor) zml.Tensor {
+            // TODO: pass img size as parameters
             var h = input.splitAxis(.n, .{ .height = 28, .weight = .auto });
             h = h.splitAxis(.height, .{ .ph = .auto, .nh = self.spatial_merge_size });
             h = h.splitAxis(.weight, .{ .pw = .auto, .nw = self.spatial_merge_size });
@@ -523,9 +607,14 @@ const VisionEncoder = struct {
         MultiModalProjector.unloadBuffers(&self.lm_head);
     }
 
-    pub fn forward(self: VisionEncoder, input: zml.Tensor) zml.Tensor {
+    pub fn forward(
+        self: VisionEncoder,
+        input: zml.Tensor,
+        attention_metadata: zml.attention.attention.Metadata,
+        attention_parameters: zml.attention.attention.Parameters,
+    ) zml.Tensor {
         stdx.debug.assert(input.shape().hasTags(.{ .batch, .channel, .width, .height }), "Input should have tags {{.batch, .channel, .width, .height }} but got {f}", .{input.shape()});
-        return self.lm_head.forward(self.model.forward(input)).reuseBuffer(input);
+        return self.lm_head.forward(self.model.forward(input, attention_metadata, attention_parameters)).reuseBuffer(input);
     }
 };
 
