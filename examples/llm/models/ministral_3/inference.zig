@@ -41,6 +41,7 @@ pub const CompiledModel = struct {
     decode: KernelExe,
     vision: KernelExe,
     embeddings: KernelExe,
+    decode_embeddings: KernelExe,
     params: CompilationOptions,
 
     pub fn init(
@@ -53,6 +54,7 @@ pub const CompiledModel = struct {
     ) !CompiledModel {
         return .{
             .embeddings = try compileEmbeddingsKernel(allocator, io, platform, model, opts.shardings, opts, progress),
+            .decode_embeddings = try compileDecodeEmbeddingsKernel(allocator, io, platform, model, opts.shardings, opts, progress),
             .vision = try compileVisionKernel(allocator, io, platform, model, opts.shardings, opts, progress),
             .prefill = try compileKernel(allocator, io, platform, model, opts.shardings, opts, progress),
             .decode = try compileDecoderKernel(allocator, io, platform, model, opts.shardings, opts, progress),
@@ -65,6 +67,7 @@ pub const CompiledModel = struct {
         self.decode.deinit();
         self.vision.deinit();
         self.embeddings.deinit();
+        self.decode_embeddings.deinit();
     }
 };
 
@@ -91,6 +94,29 @@ fn compileEmbeddingsKernel(allocator: std.mem.Allocator, io: std.Io, platform: *
     return .{ .exe = exe };
 }
 
+fn compileDecodeEmbeddingsKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platform, model: Ministral3, shardings: common.Shardings, opts: CompilationOptions, progress: *std.Progress.Node) !KernelExe {
+    progress.increaseEstimatedTotalItems(1);
+    var node = progress.start("Compiling multi modal embeddings kernel...", 1);
+    defer node.end();
+    const now: std.Io.Timestamp = .now(io, .awake);
+    defer log.info("Compiled multi modal embeddings kernel [{f}]", .{now.untilNow(io, .awake)});
+
+    const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = 1 }, .u32);
+
+    const all_shardings = shardings.all();
+    const exe = try platform.compile(
+        allocator,
+        io,
+        model.embeds,
+        .forward,
+        .{
+            tokens,
+        },
+        .{ .shardings = &all_shardings },
+    );
+    return .{ .exe = exe };
+}
+
 fn compileKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platform, model: Ministral3, shardings: common.Shardings, opts: CompilationOptions, progress: *std.Progress.Node) !KernelExe {
     progress.increaseEstimatedTotalItems(1);
     var node = progress.start("Compiling prefill kernel...", 1);
@@ -98,7 +124,8 @@ fn compileKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platfo
     const now: std.Io.Timestamp = .now(io, .awake);
     defer log.info("Compiled prefill kernel [{f}]", .{now.untilNow(io, .awake)});
 
-    const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = opts.seqlen }, .u32);
+    // const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = opts.seqlen }, .u32);
+    const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = opts.seqlen, .hidden = 3072 }, .bf16);
     const token_position_offset: zml.Tensor = .init(.{ .batch = opts.batch_dim }, .u32);
 
     const all_shardings = shardings.all();
@@ -127,7 +154,8 @@ fn compileDecoderKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml
     const now: std.Io.Timestamp = .now(io, .awake);
     defer log.info("Compiled decoder kernel [{f}]", .{now.untilNow(io, .awake)});
 
-    const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = 1 }, .u32);
+    // const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = 1 }, .u32);
+    const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = 1, .hidden = 3072 }, .bf16);
     const token_position_offset: zml.Tensor = .init(.{ .batch = opts.batch_dim }, .u32);
 
     const all_shardings = shardings.all();
@@ -231,7 +259,7 @@ const KernelExe = struct {
         defer exe_args.deinit(args.allocator);
 
         exe_args.set(.{
-            args.model_buffers,
+            args.model_buffers.embeds.embed_tokens,
             args.tokens_buf,
         });
 

@@ -56,8 +56,6 @@ pub const Config = struct {
 
 const Self = @This();
 
-embed_tokens: zml.nn.TokenEmbedding,
-
 embeds: MultiModalEmbeddings,
 
 layers: []Layer,
@@ -640,8 +638,7 @@ pub fn init(
     }
 
     return .{
-        .embed_tokens = .{ .weight = embed_tokens },
-        .embeds = .init(model_store),
+        .embeds = .{ .embed_tokens = .{ .weight = embed_tokens } },
         .layers = layers,
         .norm_head = .{
             .weights = norm,
@@ -692,7 +689,6 @@ pub fn loadBuffers(
 }
 
 pub fn unloadBuffers(self: *zml.Bufferized(Self), allocator: std.mem.Allocator) void {
-    self.embed_tokens.weight.deinit();
     MultiModalEmbeddings.unloadBuffers(&self.embeds);
     for (self.layers) |*layer| {
         Layer.unloadBuffers(layer);
@@ -713,7 +709,7 @@ pub const KvCache = struct {
             .k = seqlen,
             .h = config.text_config.num_key_value_heads,
             .hd = config.text_config.head_dim,
-        }, model.embed_tokens.weight.dtype());
+        }, model.embeds.embed_tokens.weight.dtype());
 
         return .{
             .k = .fromShape(kv_shape),
@@ -761,14 +757,6 @@ pub const KvCache = struct {
 pub const MultiModalEmbeddings = struct {
     embed_tokens: zml.nn.TokenEmbedding,
 
-    pub fn init(store: zml.io.TensorStore.View) MultiModalEmbeddings {
-        const embed_tokens = store.withPrefix("embed_tokens").createTensor("weight", .{ .voc, .hidden }, null);
-
-        return .{
-            .embed_tokens = .{ .weight = embed_tokens },
-        };
-    }
-
     pub fn unloadBuffers(self: *zml.Bufferized(MultiModalEmbeddings)) void {
         self.embed_tokens.weight.deinit();
     }
@@ -781,25 +769,24 @@ pub const MultiModalEmbeddings = struct {
 
 pub fn forward(
     self: Self,
-    tokens: zml.Tensor,
-    tokens_index: zml.Tensor,
+    embeddings: zml.Tensor,
+    embeddings_index: zml.Tensor,
     rng: zml.Tensor.Rng,
     kv_cache: KvCache,
     attention_metadata: zml.attention.attention.Metadata,
     attention_parameters: zml.attention.attention.Parameters,
 ) struct { zml.Tensor, KvCache, zml.Tensor.Rng } {
-    stdx.debug.assert(tokens.shape().hasTags(.{ .batch, .seq }), "Tokens should have tags {{.batch, .seq}}, got {f}", .{tokens.shape()});
+    stdx.debug.assert(embeddings.shape().hasTags(.{ .batch, .seq, .hidden }), "Embeddings should have tags {{.batch, .seq, .hidden}}, got {f}", .{embeddings.shape()});
 
     var cache = kv_cache;
     var kv_cache_index = zml.Tensor.scalar(@as(u32, 0), .u32);
 
-    var hidden = self.embed_tokens.forward(tokens).renameTag(.d, .hidden);
-    // var hidden = tokens;
+    var hidden = embeddings;
 
     for (self.layers) |*layer| {
         hidden, cache, kv_cache_index = layer.forward(
             hidden,
-            tokens_index,
+            embeddings_index,
             cache,
             kv_cache_index,
             attention_metadata,
@@ -811,5 +798,5 @@ pub fn forward(
     const logits = self.lm_head.forward(hidden);
 
     const gen_tokens, const new_rng = zml.nn.sampleTokens(logits, self.sampling, rng);
-    return .{ gen_tokens.convert(tokens.dtype()).reuseBuffer(tokens), cache.reuseBuffer(kv_cache), new_rng };
+    return .{ gen_tokens.convert(embeddings_index.dtype()), cache.reuseBuffer(kv_cache), new_rng };
 }
