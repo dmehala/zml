@@ -18,6 +18,7 @@ pub const CompilationOptions = struct {
     channel: u32,
     width: u32,
     height: u32,
+    hidden_size: u32,
 
     pub fn init(config: Ministral3.Config, model: Ministral3, shardings: common.Shardings, backend: zml.attention.attention.Backend, seqlen: usize) CompilationOptions {
         const batch_dim = 1;
@@ -32,6 +33,7 @@ pub const CompilationOptions = struct {
             .channel = 3,
             .width = 392,
             .height = 532,
+            .hidden_size = config.text_config.hidden_size,
         };
     }
 };
@@ -53,11 +55,11 @@ pub const CompiledModel = struct {
         progress: *std.Progress.Node,
     ) !CompiledModel {
         return .{
-            .embeddings = try compileEmbeddingsKernel(allocator, io, platform, model, opts.shardings, opts, progress),
-            .decode_embeddings = try compileDecodeEmbeddingsKernel(allocator, io, platform, model, opts.shardings, opts, progress),
+            .embeddings = try compileEmbeddingsKernel(allocator, io, platform, model, opts.shardings, opts, progress, opts.seqlen),
+            .decode_embeddings = try compileEmbeddingsKernel(allocator, io, platform, model, opts.shardings, opts, progress, 1),
             .vision = try compileVisionKernel(allocator, io, platform, model, opts.shardings, opts, progress),
-            .prefill = try compileKernel(allocator, io, platform, model, opts.shardings, opts, progress),
-            .decode = try compileDecoderKernel(allocator, io, platform, model, opts.shardings, opts, progress),
+            .prefill = try compileLanguageKernel(allocator, io, platform, model, opts.shardings, opts, progress, opts.seqlen),
+            .decode = try compileLanguageKernel(allocator, io, platform, model, opts.shardings, opts, progress, 1),
             .params = opts,
         };
     }
@@ -71,14 +73,14 @@ pub const CompiledModel = struct {
     }
 };
 
-fn compileEmbeddingsKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platform, model: Ministral3, shardings: common.Shardings, opts: CompilationOptions, progress: *std.Progress.Node) !KernelExe {
+fn compileEmbeddingsKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platform, model: Ministral3, shardings: common.Shardings, opts: CompilationOptions, progress: *std.Progress.Node, seqlen: usize) !KernelExe {
     progress.increaseEstimatedTotalItems(1);
     var node = progress.start("Compiling multi modal embeddings kernel...", 1);
     defer node.end();
     const now: std.Io.Timestamp = .now(io, .awake);
     defer log.info("Compiled multi modal embeddings kernel [{f}]", .{now.untilNow(io, .awake)});
 
-    const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = opts.seqlen }, .u32);
+    const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = seqlen }, .u32);
 
     const all_shardings = shardings.all();
     const exe = try platform.compile(
@@ -94,68 +96,14 @@ fn compileEmbeddingsKernel(allocator: std.mem.Allocator, io: std.Io, platform: *
     return .{ .exe = exe };
 }
 
-fn compileDecodeEmbeddingsKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platform, model: Ministral3, shardings: common.Shardings, opts: CompilationOptions, progress: *std.Progress.Node) !KernelExe {
+fn compileLanguageKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platform, model: Ministral3, shardings: common.Shardings, opts: CompilationOptions, progress: *std.Progress.Node, seqlen: usize) !KernelExe {
     progress.increaseEstimatedTotalItems(1);
-    var node = progress.start("Compiling multi modal embeddings kernel...", 1);
-    defer node.end();
-    const now: std.Io.Timestamp = .now(io, .awake);
-    defer log.info("Compiled multi modal embeddings kernel [{f}]", .{now.untilNow(io, .awake)});
-
-    const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = 1 }, .u32);
-
-    const all_shardings = shardings.all();
-    const exe = try platform.compile(
-        allocator,
-        io,
-        model.embeds,
-        .forward,
-        .{
-            tokens,
-        },
-        .{ .shardings = &all_shardings },
-    );
-    return .{ .exe = exe };
-}
-
-fn compileKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platform, model: Ministral3, shardings: common.Shardings, opts: CompilationOptions, progress: *std.Progress.Node) !KernelExe {
-    progress.increaseEstimatedTotalItems(1);
-    var node = progress.start("Compiling prefill kernel...", 1);
+    var node = progress.start("Compiling language kernel...", 1);
     defer node.end();
     const now: std.Io.Timestamp = .now(io, .awake);
     defer log.info("Compiled prefill kernel [{f}]", .{now.untilNow(io, .awake)});
 
-    // const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = opts.seqlen }, .u32);
-    const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = opts.seqlen, .hidden = 3072 }, .bf16);
-    const token_position_offset: zml.Tensor = .init(.{ .batch = opts.batch_dim }, .u32);
-
-    const all_shardings = shardings.all();
-    const exe = try platform.compile(
-        allocator,
-        io,
-        model,
-        .forward,
-        .{
-            tokens,
-            token_position_offset,
-            opts.rng,
-            opts.kv_cache,
-            opts.attention_metadata,
-            opts.attention_parameters,
-        },
-        .{ .shardings = &all_shardings },
-    );
-    return .{ .exe = exe };
-}
-
-fn compileDecoderKernel(allocator: std.mem.Allocator, io: std.Io, platform: *zml.Platform, model: Ministral3, shardings: common.Shardings, opts: CompilationOptions, progress: *std.Progress.Node) !KernelExe {
-    progress.increaseEstimatedTotalItems(1);
-    var node = progress.start("Compiling decoder kernel...", 1);
-    defer node.end();
-    const now: std.Io.Timestamp = .now(io, .awake);
-    defer log.info("Compiled decoder kernel [{f}]", .{now.untilNow(io, .awake)});
-
-    // const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = 1 }, .u32);
-    const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = 1, .hidden = 3072 }, .bf16);
+    const tokens: zml.Tensor = .init(.{ .batch = opts.batch_dim, .seq = seqlen, .hidden = opts.hidden_size }, .bf16);
     const token_position_offset: zml.Tensor = .init(.{ .batch = opts.batch_dim }, .u32);
 
     const all_shardings = shardings.all();
