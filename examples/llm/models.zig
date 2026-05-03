@@ -254,6 +254,7 @@ pub const Session = struct {
 
     pub fn tokenizePrompt(self: *const Session, allocator: std.mem.Allocator, prompt: []const u8) ![]const u32 {
         return switch (self.inner) {
+            .mistral3 => |*s| s.tokenizePrompt(allocator, prompt, 0),
             inline else => |*s| s.tokenizePrompt(allocator, prompt),
         };
     }

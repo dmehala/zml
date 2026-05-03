@@ -73,22 +73,30 @@ pub fn deinit(self: *Self) void {
     self.generated_token_slice.free(self.allocator);
 }
 
-pub fn tokenizePrompt(self: *const Self, allocator: std.mem.Allocator, prompt: []const u8) ![]const u32 {
+pub fn tokenizePrompt(self: *const Self, allocator: std.mem.Allocator, prompt: []const u8, img_len: u32) ![]const u32 {
     var encoder = try self.tokenizer.encoder();
     defer encoder.deinit();
 
     const bos_token = self.tokenizer.tokenToId("<s>") orelse return error.NoSuchToken;
 
-    // TODO: read system prompt from repo and add it
-    var tokens: std.ArrayList(u32) = try .initCapacity(allocator, prompt.len);
+    var tokens: std.ArrayList(u32) = try .initCapacity(allocator, prompt.len + img_len);
     try tokens.append(allocator, bos_token);
+
+    if (img_len > 0) {
+        const img_bos_token = self.tokenizer.tokenToId("[IMG]") orelse return error.NoSuchToken;
+        const img_eos_token = self.tokenizer.tokenToId("[IMG_END]") orelse return error.NoSuchToken;
+
+        try tokens.appendNTimes(allocator, img_bos_token, img_len);
+        try tokens.append(allocator, img_eos_token);
+    }
+
     try tokens.appendSlice(allocator, try encoder.encode(prompt));
 
     return tokens.toOwnedSlice(allocator);
 }
 
 pub fn tokenizeTurn(self: *const Self, allocator: std.mem.Allocator, prompt: []const u8) ![]const u32 {
-    return self.tokenizePrompt(allocator, prompt);
+    return self.tokenizePrompt(allocator, prompt, 0);
 }
 
 pub fn runPrefill(self: *Self, tokens: []const u32) !void {
@@ -103,6 +111,12 @@ pub fn runPrefill(self: *Self, tokens: []const u32) !void {
 
     var tokens_buffer: zml.Buffer = try .fromSlice(self.io, self.platform, tokens_slice, replicated_sharding);
     defer tokens_buffer.deinit();
+
+    // try self.compiled_model.embeddings.run_embeddings(.{
+    //     .allocator = self.allocator,
+    //     .model_buffers = self.model_buffers,
+    //     .tokens_buf = &tokens_buffer,
+    // });
 
     const token_pos_slice: zml.Slice = .init(zml.Shape.init(.{ .batch = 1 }, .u32), std.mem.sliceAsBytes(&[_]u32{0}));
     var token_pos_buffer: zml.Buffer = try .fromSlice(self.io, self.platform, token_pos_slice, replicated_sharding);
@@ -149,6 +163,12 @@ pub fn runDecode(self: *Self, all_tokens: *std.ArrayList(u32), stdout: *std.Io.W
         const token_pos_slice: zml.Slice = .init(zml.Shape.init(.{ .batch = 1 }, .u32), std.mem.sliceAsBytes(&[_]u32{@intCast(all_tokens.items.len)}));
         var token_pos_buffer: zml.Buffer = try .fromSlice(self.io, self.platform, token_pos_slice, replicated_sharding);
         defer token_pos_buffer.deinit();
+
+        // try self.compiled_model.embeddings.run_embeddings(.{
+        //     .allocator = self.allocator,
+        //     .model_buffers = self.model_buffers,
+        //     .tokens_buf = &token_buffer,
+        // });
 
         try self.compiled_model.decode.run(.{
             .allocator = self.allocator,

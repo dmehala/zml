@@ -58,6 +58,8 @@ const Self = @This();
 
 embed_tokens: zml.nn.TokenEmbedding,
 
+embeds: MultiModalEmbeddings,
+
 layers: []Layer,
 
 // Final layer
@@ -639,6 +641,7 @@ pub fn init(
 
     return .{
         .embed_tokens = .{ .weight = embed_tokens },
+        .embeds = .init(model_store),
         .layers = layers,
         .norm_head = .{
             .weights = norm,
@@ -690,6 +693,7 @@ pub fn loadBuffers(
 
 pub fn unloadBuffers(self: *zml.Bufferized(Self), allocator: std.mem.Allocator) void {
     self.embed_tokens.weight.deinit();
+    MultiModalEmbeddings.unloadBuffers(&self.embeds);
     for (self.layers) |*layer| {
         Layer.unloadBuffers(layer);
     }
@@ -754,6 +758,27 @@ pub const KvCache = struct {
     }
 };
 
+pub const MultiModalEmbeddings = struct {
+    embed_tokens: zml.nn.TokenEmbedding,
+
+    pub fn init(store: zml.io.TensorStore.View) MultiModalEmbeddings {
+        const embed_tokens = store.withPrefix("embed_tokens").createTensor("weight", .{ .voc, .hidden }, null);
+
+        return .{
+            .embed_tokens = .{ .weight = embed_tokens },
+        };
+    }
+
+    pub fn unloadBuffers(self: *zml.Bufferized(MultiModalEmbeddings)) void {
+        self.embed_tokens.weight.deinit();
+    }
+
+    pub fn forward(self: MultiModalEmbeddings, tokens: zml.Tensor) zml.Tensor {
+        const embs = self.embed_tokens.forward(tokens).renameTag(.d, .hidden);
+        return embs;
+    }
+};
+
 pub fn forward(
     self: Self,
     tokens: zml.Tensor,
@@ -769,6 +794,7 @@ pub fn forward(
     var kv_cache_index = zml.Tensor.scalar(@as(u32, 0), .u32);
 
     var hidden = self.embed_tokens.forward(tokens).renameTag(.d, .hidden);
+    // var hidden = tokens;
 
     for (self.layers) |*layer| {
         hidden, cache, kv_cache_index = layer.forward(
